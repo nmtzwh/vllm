@@ -83,6 +83,12 @@ struct FP16Vec16 : public Vec<FP16Vec16> {
   // ASIMD does not support non-temporal loads
   explicit FP16Vec16(bool, const void* ptr) : FP16Vec16(ptr) {}
 
+  explicit FP16Vec16(const c10::Half v) {
+    float16x8_t v8 = vdupq_n_f16(*reinterpret_cast<const __fp16*>(&v.x));
+    reg.val[0] = v8;
+    reg.val[1] = v8;
+  }
+
   explicit FP16Vec16(const FP32Vec16& vec);
   void save(void* ptr) const {
     vst1q_f16(reinterpret_cast<__fp16*>(ptr), reg.val[0]);
@@ -197,6 +203,12 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
 
   explicit BF16Vec16(bfloat16x8x2_t data) : reg(data) {};
 
+  explicit BF16Vec16(const c10::BFloat16 v) {
+    bfloat16x8_t v8 = vreinterpretq_bf16_u16(vdupq_n_u16(v.x));
+    reg.val[0] = v8;
+    reg.val[1] = v8;
+  }
+
   explicit BF16Vec16(const FP32Vec16&);
 
   explicit BF16Vec16(float32x4x4_t v)
@@ -291,9 +303,9 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
 
   float32x4x2_t reg;
 
-  explicit FP32Vec8(float v) : reg({vmovq_n_f32(v), vmovq_n_f32(v)}) {};
+  explicit FP32Vec8(float v) : reg({vdupq_n_f32(v), vdupq_n_f32(v)}) {};
 
-  explicit FP32Vec8() : reg({vmovq_n_f32(0.0), vmovq_n_f32(0.0)}) {};
+  explicit FP32Vec8() : reg({vdupq_n_f32(0.0), vdupq_n_f32(0.0)}) {};
 
   explicit FP32Vec8(const float* ptr)
       : reg({vld1q_f32(ptr), vld1q_f32(ptr + 4)}) {};
@@ -469,11 +481,11 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
   float32x4x4_t reg;
 
   explicit FP32Vec16(float v)
-      : reg({vmovq_n_f32(v), vmovq_n_f32(v), vmovq_n_f32(v), vmovq_n_f32(v)}) {}
+      : reg({vdupq_n_f32(v), vdupq_n_f32(v), vdupq_n_f32(v), vdupq_n_f32(v)}) {}
 
   explicit FP32Vec16()
-      : reg({vmovq_n_f32(0.0), vmovq_n_f32(0.0), vmovq_n_f32(0.0),
-             vmovq_n_f32(0.0)}) {}
+      : reg({vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0),
+             vdupq_n_f32(0.0)}) {}
 
   explicit FP32Vec16(const float* ptr)
       : reg({vld1q_f32(ptr), vld1q_f32(ptr + 4), vld1q_f32(ptr + 8),

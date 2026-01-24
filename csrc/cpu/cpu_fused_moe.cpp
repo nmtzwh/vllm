@@ -3,6 +3,10 @@
 #include "cpu/micro_gemm/cpu_micro_gemm_vec.hpp"
 #include "cpu/cpu_arch_macros.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef CPU_CAPABILITY_AMXBF16
   #include "cpu/micro_gemm/cpu_micro_gemm_amx.hpp"
   #define AMX_DISPATCH(...)                                                    \
@@ -48,16 +52,41 @@ void swigluoai_and_mul(float* __restrict__ input, scalar_t* __restrict__ output,
                        const int32_t input_stride,
                        const int32_t output_stride) {
   using scalar_vec_t = typename cpu_utils::VecTypeTrait<scalar_t>::vec_t;
-  // For GPT-OSS interleaved gate-up weights
-  alignas(64) static int32_t index[16] = {0,  2,  4,  6,  8,  10, 12, 14,
-                                          16, 18, 20, 22, 24, 26, 28, 30};
-  vec_op::INT32Vec16 index_vec(index);
   vec_op::FP32Vec16 gate_up_max_vec(7.0);
   vec_op::FP32Vec16 up_min_vec(-7.0);
   vec_op::FP32Vec16 alpha_vec(1.702);
   vec_op::FP32Vec16 one_vec(1.0);
 
   DEFINE_FAST_EXP
+
+#ifdef __aarch64__
+  for (int32_t m = 0; m < m_size; ++m) {
+    for (int32_t n = 0; n < n_size; n += 32) {
+      float32x4x4_t gate_reg, up_reg;
+      for (int i = 0; i < 4; ++i) {
+        float32x4x2_t loaded = vld2q_f32(input + n + i * 8);
+        gate_reg.val[i] = loaded.val[0];
+        up_reg.val[i] = loaded.val[1];
+      }
+      vec_op::FP32Vec16 gate_vec(gate_reg);
+      vec_op::FP32Vec16 up_vec(up_reg);
+
+      gate_vec = gate_vec.min(gate_up_max_vec);
+      up_vec = up_vec.clamp(up_min_vec, gate_up_max_vec);
+      auto sigmoid_vec = one_vec / (one_vec + fast_exp(-gate_vec * alpha_vec));
+      auto glu = gate_vec * sigmoid_vec;
+      auto gated_output_fp32 = (one_vec + up_vec) * glu;
+      scalar_vec_t gated_output = scalar_vec_t(gated_output_fp32);
+      gated_output.save(output + n / 2);
+    }
+    input += input_stride;
+    output += output_stride;
+  }
+#else
+  // For GPT-OSS interleaved gate-up weights
+  alignas(64) static int32_t index[16] = {0,  2,  4,  6,  8,  10, 12, 14,
+                                          16, 18, 20, 22, 24, 26, 28, 30};
+  vec_op::INT32Vec16 index_vec(index);
 
   for (int32_t m = 0; m < m_size; ++m) {
     for (int32_t n = 0; n < n_size; n += 32) {
@@ -74,6 +103,7 @@ void swigluoai_and_mul(float* __restrict__ input, scalar_t* __restrict__ output,
     input += input_stride;
     output += output_stride;
   }
+#endif
 }
 
 template <typename scalar_t>

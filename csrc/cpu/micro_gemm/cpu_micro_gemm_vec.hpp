@@ -102,7 +102,11 @@ class TileGemm82 {
 template <typename scalar_t>
 class MicroGemm<cpu_utils::ISA::VEC, scalar_t> {
  public:
+#ifdef __aarch64__
+  static constexpr int32_t MaxMSize = 4;
+#else
   static constexpr int32_t MaxMSize = 8;
+#endif
   static constexpr int32_t NSize = 32;
 
  public:

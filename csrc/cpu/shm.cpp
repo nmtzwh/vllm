@@ -5,6 +5,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef __aarch64__
   #include <atomic>
 #endif
@@ -27,10 +31,12 @@ struct KernelVecType<float> {
   using scalar_vec_t = vec_op::FP32Vec16;
 };
 
+#if !defined(__aarch64__) || defined(ARM_BF16_SUPPORT)
 template <>
 struct KernelVecType<c10::BFloat16> {
   using scalar_vec_t = vec_op::BF16Vec16;
 };
+#endif
 
 template <>
 struct KernelVecType<c10::Half> {

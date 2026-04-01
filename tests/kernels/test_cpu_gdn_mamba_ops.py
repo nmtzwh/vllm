@@ -48,6 +48,25 @@ def _reference_causal_conv1d_update(
     return out, state_ref
 
 
+def _reference_causal_conv1d_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    silu: bool,
+) -> torch.Tensor:
+    # x is expected in transposed layout [B, D, T]
+    x_pad = torch.nn.functional.pad(x.to(torch.float32), (weight.size(1) - 1, 0))
+    y = torch.nn.functional.conv1d(
+        x_pad,
+        weight.to(torch.float32).unsqueeze(1),
+        bias=bias.to(torch.float32) if bias is not None else None,
+        groups=x.size(1),
+    )
+    if silu:
+        y = torch.nn.functional.silu(y)
+    return y.to(x.dtype)
+
+
 def _reference_fused_sigmoid_update(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -98,6 +117,41 @@ def _reference_fused_sigmoid_update(
                 state_ref[cache_index, vi] = updated_state
 
     return out, state_ref
+
+
+@pytest.mark.parametrize("silu", [False, True])
+def test_cpu_causal_conv1d_fwd_matches_reference(silu: bool) -> None:
+    torch.manual_seed(7)
+
+    batch = 2
+    dim = 64
+    seqlen = 5
+    width = 4
+
+    x = torch.randn(batch, seqlen, dim, dtype=torch.bfloat16).transpose(1, 2)
+    weight = torch.randn(dim, width, dtype=torch.bfloat16)
+    bias = torch.randn(dim, dtype=torch.bfloat16)
+
+    expected_out = _reference_causal_conv1d_fwd(x, weight, bias, silu)
+    actual_out = custom_ops.cpu_causal_conv1d_fwd(
+        x,
+        weight,
+        bias,
+        None,
+        None,
+        None,
+        None,
+        silu,
+        -1,
+        False,
+    )
+
+    torch.testing.assert_close(
+        actual_out.to(torch.float32),
+        expected_out.to(torch.float32),
+        atol=2e-2,
+        rtol=2e-2,
+    )
 
 
 @pytest.mark.parametrize("silu", [False, True])
@@ -173,6 +227,46 @@ def test_cpu_fused_gdn_gating_matches_reference() -> None:
         atol=2e-2,
         rtol=2e-2,
     )
+
+
+def test_cpu_chunk_gated_delta_rule_smoke() -> None:
+    torch.manual_seed(11)
+
+    bsz = 1
+    seq_len = 4
+    qk_heads = 2
+    v_heads = 4
+    qk_dim = 32
+    v_dim = 32
+    num_states = 2
+
+    q = torch.randn(bsz, seq_len, qk_heads, qk_dim, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(bsz, seq_len, v_heads, v_dim, dtype=torch.bfloat16)
+    g = torch.randn(bsz, seq_len, v_heads, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(bsz, seq_len, v_heads)).to(torch.bfloat16)
+    initial_state = torch.randn(
+        num_states, v_heads, qk_dim, v_dim, dtype=torch.float32
+    )
+    cu_seqlens = torch.tensor([0, seq_len, seq_len], dtype=torch.int32)
+
+    out, final_state = custom_ops.cpu_chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        True,
+        cu_seqlens,
+        False,
+        True,
+    )
+
+    assert out.shape == v.shape
+    assert final_state.shape == initial_state.shape
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(final_state).all()
 
 
 def test_cpu_fused_sigmoid_gating_delta_rule_update_matches_reference() -> None:

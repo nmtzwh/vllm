@@ -163,7 +163,11 @@ class CpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         if not cache_config.user_specified_block_size:
-            cache_config.block_size = 128
+            # Hybrid attention+mamba models may compute a larger block size
+            # later to match Mamba page size requirements. Do not overwrite
+            # that derived value with the CPU default.
+            if model_config is None or not model_config.is_hybrid:
+                cache_config.block_size = 128
 
         if cache_config.block_size % 32 != 0:
             logger.warning(

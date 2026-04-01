@@ -1056,13 +1056,13 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     bool output_final_state,
     const at::Tensor& cu_seqlens,
     bool head_first,
-    bool use_qk_l2norm_in_kernel,
-    double eps = 1e-5) {
+    bool use_qk_l2norm_in_kernel) {
   RECORD_FUNCTION(
       "sgl-kernel::chunk_gated_delta_rule_cpu", std::vector<c10::IValue>({query, key, value, g, beta, initial_state}));
 
   TORCH_CHECK(head_first == false, "chunk_gated_delta_rule_cpu does not support head first");
   int64_t B = query.size(0);
+  constexpr double eps = 1e-5;
   int64_t global_seq_len = query.size(1);
   int64_t qk_num_head = query.size(2);
   int64_t qk_head_size = query.size(3);
@@ -1231,9 +1231,7 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     at::Tensor& initial_state_source,
     const at::Tensor& initial_state_indices,
     const at::Tensor& cu_seqlens,
-    bool use_qk_l2norm_in_kernel,
-    double softplus_beta = 1.0,
-    double softplus_threshold = 20.0) {
+    bool use_qk_l2norm_in_kernel) {
   RECORD_FUNCTION(
       "sgl-kernel::fused_sigmoid_gating_delta_rule_update_cpu",
       std::vector<c10::IValue>(
@@ -1270,6 +1268,7 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   int64_t v_strideB = v.stride(1);
   int64_t v_strideS = v.stride(0);
   int64_t v_strideH = v.stride(2);
+  constexpr double softplus_threshold = 20.0;
   at::Tensor core_attn_out = at::empty({batch_size, seq_len, v_num_heads, v_head_dim}, q.options());
   at::Tensor qk_scale_buf = at::empty({2 * batch_size, seq_len, num_heads}, at::kFloat);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "fused_sigmoid_gating_delta_rule_update_kernel_impl", [&] {

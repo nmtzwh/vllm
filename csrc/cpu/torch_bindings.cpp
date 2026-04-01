@@ -147,15 +147,14 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& g, const at::Tensor& beta,
     const at::Tensor& initial_state, bool output_final_state,
     const at::Tensor& cu_seqlens, bool head_first,
-    bool use_qk_l2norm_in_kernel, double eps);
+    bool use_qk_l2norm_in_kernel);
 
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log, const at::Tensor& dt_bias,
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& a, const at::Tensor& b, at::Tensor& initial_state_source,
     const at::Tensor& initial_state_indices, const at::Tensor& cu_seqlens,
-    bool use_qk_l2norm_in_kernel, double softplus_beta,
-    double softplus_threshold);
+    bool use_qk_l2norm_in_kernel);
 
 std::tuple<at::Tensor, at::Tensor> fused_gdn_gating_cpu(
     const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b,

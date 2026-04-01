@@ -1,4 +1,5 @@
 include(FetchContent)
+include(CheckIncludeFileCXX)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
@@ -127,7 +128,33 @@ elseif (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)
 
 elseif (ASIMD_FOUND)
     message(STATUS "ARMv8 or later architecture detected")
-    if(ARM_BF16_FOUND)
+    if(NOT APPLE_SILICON_FOUND)
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_REQUIRED_FLAGS "-march=armv8.6-a+sve+bf16")
+        check_cxx_source_compiles("
+            #include <arm_sve.h>
+            int main() {
+                svfloat32_t a = svdup_f32(1.0f);
+                svbfloat16_t b = svreinterpret_bf16_u16(svdup_u16(0));
+                (void)a;
+                (void)b;
+                return 0;
+            }
+        " VLLM_CPU_HAS_SVE_BF16)
+        unset(CMAKE_REQUIRED_FLAGS)
+    else()
+        set(VLLM_CPU_HAS_SVE_BF16 OFF)
+    endif()
+    if(VLLM_CPU_HAS_SVE_BF16)
+        message(STATUS "SVE + BF16 support detected")
+        add_compile_definitions(SGLANG_WITH_SVE)
+        if("$ENV{SGLANG_SVE512_VEC}" STREQUAL "1")
+            message(STATUS "Enabling fixed-length SVE-512 vectorized fallback")
+            add_compile_definitions(SGLANG_SVE512_VEC)
+            list(APPEND CXX_COMPILE_FLAGS "-msve-vector-bits=512")
+        endif()
+        set(MARCH_FLAGS "-march=armv8.6-a+sve2+bf16+fp16")
+    elseif(ARM_BF16_FOUND)
         message(STATUS "BF16 extension detected")
         set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16")
         add_compile_definitions(ARM_BF16_SUPPORT)
@@ -324,6 +351,14 @@ else()
 endif()
 
 if(ENABLE_NUMA)
+    check_include_file_cxx("numa.h" VLLM_CPU_HAS_NUMA_H)
+    if(NOT VLLM_CPU_HAS_NUMA_H)
+        message(WARNING "numa.h not found; disabling NUMA support")
+        set(ENABLE_NUMA OFF)
+    endif()
+endif()
+
+if(ENABLE_NUMA)
     list(APPEND LIBS numa)
 else()
     message(STATUS "NUMA is disabled")
@@ -354,6 +389,8 @@ set(VLLM_EXT_SRC
     "csrc/cpu/pos_encoding.cpp"
     "csrc/moe/dynamic_4bit_int_moe_cpu.cpp"
     "csrc/cpu/cpu_attn.cpp"
+    "csrc/cpu/sgl-kernels/mamba_conv.cpp"
+    "csrc/cpu/sgl-kernels/mamba_fla.cpp"
     "csrc/cpu/torch_bindings.cpp")
 
 if (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND)
@@ -373,6 +410,8 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/sgl-kernels/gemm.cpp"
         "csrc/cpu/sgl-kernels/gemm_int8.cpp"
         "csrc/cpu/sgl-kernels/gemm_fp8.cpp"
+        "csrc/cpu/sgl-kernels/mamba_conv.cpp"
+        "csrc/cpu/sgl-kernels/mamba_fla.cpp"
         "csrc/cpu/sgl-kernels/moe.cpp"
         "csrc/cpu/sgl-kernels/moe_int8.cpp"
         "csrc/cpu/sgl-kernels/moe_fp8.cpp")

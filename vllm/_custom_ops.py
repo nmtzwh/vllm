@@ -3254,6 +3254,119 @@ def cpu_attention_with_kv_cache(
     )
 
 
+def cpu_causal_conv1d_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None,
+    conv_state_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    silu_activation: bool,
+    pad_slot_id: int,
+    is_vnni: bool,
+) -> torch.Tensor:
+    return torch.ops._C.cpu_causal_conv1d_fwd(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        conv_state_indices,
+        has_initial_state,
+        silu_activation,
+        pad_slot_id,
+        is_vnni,
+    )
+
+
+def cpu_causal_conv1d_update(
+    x: torch.Tensor,
+    conv_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    silu_activation: bool,
+    cache_seqlens: torch.Tensor | None,
+    conv_state_indices: torch.Tensor | None,
+    pad_slot_id: int,
+    is_vnni: bool,
+) -> torch.Tensor:
+    return torch.ops._C.cpu_causal_conv1d_update(
+        x,
+        conv_states,
+        weight,
+        bias,
+        silu_activation,
+        cache_seqlens,
+        conv_state_indices,
+        pad_slot_id,
+        is_vnni,
+    )
+
+
+def cpu_chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor,
+    head_first: bool,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.cpu_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        head_first,
+        use_qk_l2norm_in_kernel,
+    )
+
+
+def cpu_fused_sigmoid_gating_delta_rule_update(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> torch.Tensor:
+    return torch.ops._C.cpu_fused_sigmoid_gating_delta_rule_update(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        initial_state_source,
+        initial_state_indices,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel,
+    )
+
+
+def cpu_fused_gdn_gating(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.cpu_fused_gdn_gating(A_log, a, b, dt_bias)
+
+
 def cpu_gemm_wna16(
     input: torch.Tensor,
     q_weight: torch.Tensor,

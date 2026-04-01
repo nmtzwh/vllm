@@ -10,6 +10,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
+from vllm import _custom_ops as custom_ops
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -85,6 +86,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from .interfaces import (
     HasInnerState,
@@ -631,6 +633,331 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    def _has_cpu_gdn_kernels(self) -> bool:
+        return hasattr(torch.ops._C, "cpu_causal_conv1d_update")
+
+    def _can_use_cpu_gdn_kernels(
+        self, mixed_qkv: torch.Tensor, attn_metadata: GDNAttentionMetadata
+    ) -> bool:
+        return (
+            self._has_cpu_gdn_kernels()
+            and mixed_qkv.dtype == torch.bfloat16
+            and self.head_k_dim % 32 == 0
+            and self.head_v_dim % 32 == 0
+            and attn_metadata.spec_sequence_masks is None
+        )
+
+    def _cpu_conv1d_forward_fallback(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        has_initial_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        width = conv_weights.size(1)
+        out = torch.empty_like(x)
+        use_silu = self.activation in ("silu", "swish")
+        for seq_idx in range(state_indices.size(0)):
+            cache_idx = int(state_indices[seq_idx].item())
+            if cache_idx == PAD_SLOT_ID:
+                continue
+            start = int(query_start_loc[seq_idx].item())
+            end = int(query_start_loc[seq_idx + 1].item())
+            if end <= start:
+                continue
+            if has_initial_state is not None and not bool(has_initial_state[seq_idx]):
+                seq_state = torch.zeros_like(conv_state[cache_idx])
+            else:
+                seq_state = conv_state[cache_idx].clone()
+            for tok in range(start, end):
+                window = torch.cat((seq_state, x[tok].unsqueeze(-1)), dim=-1)
+                y = (window * conv_weights).sum(dim=-1)
+                if self.conv1d.bias is not None:
+                    y = y + self.conv1d.bias
+                if use_silu:
+                    y = torch.nn.functional.silu(y)
+                out[tok] = y.to(out.dtype)
+                seq_state = window[:, 1:width]
+            conv_state[cache_idx] = seq_state.to(conv_state.dtype)
+        return out
+
+    def _cpu_recurrent_sequence_fallback(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        has_initial_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # q/k/v: [1, L, H, D] ; ssm_state: [N, HV, V, K]
+        seq_len = q.size(1)
+        num_q_heads = q.size(2)
+        num_v_heads = v.size(2)
+        group_size = num_v_heads // num_q_heads
+        scale = self.head_k_dim**-0.5
+        out = torch.empty(
+            (1, seq_len, num_v_heads, self.head_v_dim),
+            device=q.device,
+            dtype=q.dtype,
+        )
+        for seq_idx in range(state_indices.size(0)):
+            cache_idx = int(state_indices[seq_idx].item())
+            if cache_idx == PAD_SLOT_ID:
+                continue
+            start = int(query_start_loc[seq_idx].item())
+            end = int(query_start_loc[seq_idx + 1].item())
+            if end <= start:
+                continue
+            state = ssm_state[cache_idx].clone().to(torch.float32)
+            if has_initial_state is not None and not bool(has_initial_state[seq_idx]):
+                state.zero_()
+            for tok in range(start, end):
+                a_tok = a[tok].to(torch.float32)
+                b_tok = b[tok].to(torch.float32)
+                for vi in range(num_v_heads):
+                    qi = vi // group_size
+                    q_vec = q[0, tok, qi].to(torch.float32)
+                    k_vec = k[0, tok, qi].to(torch.float32)
+                    v_vec = v[0, tok, vi].to(torch.float32)
+                    q_vec = torch.nn.functional.normalize(q_vec, dim=-1, eps=1e-5)
+                    k_vec = torch.nn.functional.normalize(k_vec, dim=-1, eps=1e-5)
+                    g_val = -torch.exp(self.A_log[vi].to(torch.float32)) * (
+                        torch.nn.functional.softplus(
+                            a_tok[vi] + self.dt_bias[vi].to(torch.float32)
+                        )
+                    )
+                    beta_val = torch.sigmoid(b_tok[vi])
+                    g_exp = torch.exp(g_val)
+                    state_vk = state[vi] * g_exp
+                    kv_mem = state_vk @ k_vec
+                    dt = (v_vec - kv_mem) * beta_val
+                    state_vk = state_vk + torch.outer(dt, k_vec)
+                    out[0, tok, vi] = (state_vk @ q_vec * scale).to(out.dtype)
+                    state[vi] = state_vk
+            ssm_state[cache_idx] = state.to(ssm_state.dtype)
+        return out
+
+    def _forward_core_cpu_fallback(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        virtual_engine: int,
+    ) -> None:
+        if attn_metadata.spec_sequence_masks is not None:
+            raise NotImplementedError(
+                "CPU GDN fallback does not support speculative decoding."
+            )
+        self_kv_cache = self.kv_cache[virtual_engine]
+        conv_state = self_kv_cache[0].transpose(-1, -2)
+        ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        state_indices = attn_metadata.non_spec_state_indices_tensor.to(dtype=torch.int64)
+        query_start_loc = attn_metadata.non_spec_query_start_loc.to(dtype=torch.int64)
+        mixed_qkv_non_spec = self._cpu_conv1d_forward_fallback(
+            mixed_qkv.to(conv_state.dtype),
+            conv_state,
+            conv_weights,
+            state_indices,
+            query_start_loc,
+            attn_metadata.has_initial_state,
+        ).to(mixed_qkv.dtype)
+        q, k, v = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        out = self._cpu_recurrent_sequence_fallback(
+            q,
+            k,
+            v,
+            a,
+            b,
+            ssm_state,
+            state_indices,
+            query_start_loc,
+            attn_metadata.has_initial_state,
+        )
+        core_attn_out[:num_actual_tokens] = out.squeeze(0)
+
+    def _get_cpu_recurrent_state(
+        self, ssm_state: torch.Tensor, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # vLLM stores GDN state as [H, V, K], while the reused CPU kernels
+        # update [H, K, V]. Adapt only the touched states and keep the cache
+        # layout unchanged.
+        state = ssm_state[indices].transpose(-1, -2).contiguous().to(torch.float32)
+        local_indices = torch.arange(
+            state.size(0), dtype=torch.int32, device=state.device
+        )
+        return state, local_indices
+
+    def _commit_cpu_recurrent_state(
+        self, ssm_state: torch.Tensor, indices: torch.Tensor, state_kv: torch.Tensor
+    ) -> None:
+        ssm_state[indices] = state_kv.transpose(-1, -2).to(ssm_state.dtype)
+
+    def _forward_core_cpu(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        virtual_engine: int,
+    ) -> None:
+        if not self._can_use_cpu_gdn_kernels(mixed_qkv, attn_metadata):
+            return self._forward_core_cpu_fallback(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+                virtual_engine=virtual_engine,
+            )
+
+        if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes > 0:
+            return self._forward_core_decode_non_spec_cpu(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+                virtual_engine=virtual_engine,
+            )
+
+        has_initial_state = attn_metadata.has_initial_state
+        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc.to(
+            dtype=torch.int32
+        )
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor.to(
+            dtype=torch.int32
+        )
+        self_kv_cache = self.kv_cache[virtual_engine]
+        conv_state = self_kv_cache[0].transpose(-1, -2)
+        ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        mixed_qkv_non_spec = custom_ops.cpu_causal_conv1d_fwd(
+            mixed_qkv.transpose(0, 1),
+            conv_weights,
+            self.conv1d.bias,
+            conv_state,
+            non_spec_query_start_loc,
+            non_spec_state_indices_tensor,
+            has_initial_state,
+            self.activation in ("silu", "swish"),
+            PAD_SLOT_ID,
+            False,
+        ).transpose(0, 1)
+
+        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+            mixed_qkv_non_spec
+        )
+        g_non_spec, beta_non_spec = custom_ops.cpu_fused_gdn_gating(
+            self.A_log, a, b, self.dt_bias
+        )
+        initial_state, _ = self._get_cpu_recurrent_state(
+            ssm_state, non_spec_state_indices_tensor
+        )
+        initial_state[~has_initial_state, ...] = 0
+        core_attn_out_non_spec, last_state = custom_ops.cpu_chunk_gated_delta_rule(
+            query_non_spec,
+            key_non_spec,
+            value_non_spec,
+            g_non_spec,
+            beta_non_spec,
+            initial_state,
+            True,
+            non_spec_query_start_loc,
+            False,
+            True,
+        )
+        self._commit_cpu_recurrent_state(
+            ssm_state, non_spec_state_indices_tensor, last_state
+        )
+        core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+    def _forward_core_decode_non_spec_cpu(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        virtual_engine: int,
+    ) -> None:
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor.to(
+            dtype=torch.int32
+        )
+        self_kv_cache = self.kv_cache[virtual_engine]
+        conv_state = self_kv_cache[0].transpose(-1, -2)
+        ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        decode_state_indices = non_spec_state_indices_tensor[:num_actual_tokens]
+        mixed_qkv_non_spec = custom_ops.cpu_causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation in ("silu", "swish"),
+            None,
+            decode_state_indices,
+            PAD_SLOT_ID,
+            False,
+        )
+
+        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+            mixed_qkv_non_spec
+        )
+        local_state, local_state_indices = self._get_cpu_recurrent_state(
+            ssm_state, decode_state_indices
+        )
+        core_attn_out_non_spec = custom_ops.cpu_fused_sigmoid_gating_delta_rule_update(
+            self.A_log,
+            self.dt_bias,
+            query_non_spec,
+            key_non_spec,
+            value_non_spec,
+            a,
+            b,
+            local_state,
+            local_state_indices,
+            attn_metadata.non_spec_query_start_loc[
+                : attn_metadata.num_decodes + 1
+            ].to(dtype=torch.int32),
+            True,
+        )
+        self._commit_cpu_recurrent_state(
+            ssm_state, decode_state_indices, local_state
+        )
+        core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -715,6 +1042,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
+        if mixed_qkv.device.type == "cpu":
+            return
         if hasattr(self, "_prefill_kernels_warmed_up"):
             return
         self._prefill_kernels_warmed_up = True
@@ -802,6 +1131,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+
+        if mixed_qkv.device.type == "cpu":
+            return self._forward_core_cpu(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+                virtual_engine=forward_context.virtual_engine,
+            )
 
         if (
             self.enable_packed_recurrent_decode
@@ -1761,6 +2100,16 @@ def fused_gdn_gating(
     beta_output = b.sigmoid()
     TODO maybe use torch.compile to replace this triton kernel
     """
+    if a.device.type == "cpu":
+        if hasattr(torch.ops._C, "cpu_fused_gdn_gating"):
+            return custom_ops.cpu_fused_gdn_gating(A_log, a, b, dt_bias)
+        x = a.float() + dt_bias.float()
+        g = -torch.exp(A_log.float()).unsqueeze(0) * torch.nn.functional.softplus(
+            x, beta=beta, threshold=threshold
+        )
+        beta_output = torch.sigmoid(b.float()).to(b.dtype)
+        return g.unsqueeze(0), beta_output.unsqueeze(0)
+
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))

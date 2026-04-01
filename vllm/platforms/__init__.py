@@ -164,7 +164,16 @@ def cpu_platform_plugin() -> str | None:
     is_cpu = False
     logger.debug("Checking if CPU platform is available.")
     try:
-        is_cpu = vllm_version_matches_substr("cpu")
+        # Source-tree workflows may not have package metadata available.
+        # Respect explicit target-device override first.
+        if envs.VLLM_TARGET_DEVICE == "cpu":
+            is_cpu = True
+            logger.debug(
+                "Confirmed CPU platform is available because "
+                "VLLM_TARGET_DEVICE=cpu."
+            )
+        if not is_cpu:
+            is_cpu = vllm_version_matches_substr("cpu")
         if is_cpu:
             logger.debug(
                 "Confirmed CPU platform is available because vLLM is built with CPU."

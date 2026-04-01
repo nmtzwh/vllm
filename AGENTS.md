@@ -39,6 +39,17 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 ## 2. Development Workflow
 
+### Local machine constraints (mandatory for this workspace)
+
+- Activate the project virtualenv for all vLLM build/test/run commands:
+  `source $HOME/virtualenv/venv_vllm/bin/activate`
+- Treat this machine as AVX2-only for runtime validation.
+  Do not assume AVX512 or AMX support.
+- For performance-sensitive commands (builds, tests, benchmarks), pin
+  execution to cores `0-3` and limit OpenMP threads accordingly, e.g.:
+  `taskset -c 0-3 ...`, `OMP_NUM_THREADS=4`, and
+  `VLLM_CPU_OMP_THREADS_BIND=0-3`.
+
 ### Environment setup
 
 ```bash

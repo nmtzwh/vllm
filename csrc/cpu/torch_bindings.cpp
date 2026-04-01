@@ -126,6 +126,41 @@ void cpu_fused_moe(torch::Tensor& output, const torch::Tensor& input,
                    const torch::Tensor& topk_id, const bool skip_weighted,
                    const std::string& act, const std::string& isa);
 
+at::Tensor causal_conv1d_fwd_cpu(
+    const at::Tensor& x, const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& conv_state_indices,
+    const std::optional<at::Tensor>& has_initial_state, bool silu_activation,
+    int64_t pad_slot_id, bool is_vnni);
+
+at::Tensor causal_conv1d_update_cpu(
+    const at::Tensor& x, const at::Tensor& conv_states,
+    const at::Tensor& weight, const std::optional<at::Tensor>& bias,
+    bool silu_activation, const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices, int64_t pad_slot_id,
+    bool is_vnni);
+
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const at::Tensor& g, const at::Tensor& beta,
+    const at::Tensor& initial_state, bool output_final_state,
+    const at::Tensor& cu_seqlens, bool head_first,
+    bool use_qk_l2norm_in_kernel, double eps);
+
+at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
+    const at::Tensor& A_log, const at::Tensor& dt_bias,
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& a, const at::Tensor& b, at::Tensor& initial_state_source,
+    const at::Tensor& initial_state_indices, const at::Tensor& cu_seqlens,
+    bool use_qk_l2norm_in_kernel, double softplus_beta,
+    double softplus_threshold);
+
+std::tuple<at::Tensor, at::Tensor> fused_gdn_gating_cpu(
+    const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b,
+    const at::Tensor& dt_bias);
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
 
@@ -300,6 +335,39 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sliding_window_left, SymInt sliding_window_right, Tensor block_table, "
       "float softcap, Tensor scheduler_metadata, Tensor? s_aux) -> ()",
       &cpu_attention_with_kv_cache);
+
+#if defined(__AVX512F__) || (defined(__aarch64__) && !defined(__APPLE__))
+  ops.def(
+      "cpu_causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, Tensor? "
+      "conv_states, Tensor? query_start_loc, Tensor? conv_state_indices, "
+      "Tensor? has_initial_state, bool silu_activation, SymInt pad_slot_id, "
+      "bool is_vnni) -> Tensor");
+  ops.impl("cpu_causal_conv1d_fwd", torch::kCPU, &causal_conv1d_fwd_cpu);
+  ops.def(
+      "cpu_causal_conv1d_update(Tensor x, Tensor conv_states, Tensor weight, "
+      "Tensor? bias, bool silu_activation, Tensor? cache_seqlens, Tensor? "
+      "conv_state_indices, SymInt pad_slot_id, bool is_vnni) -> Tensor");
+  ops.impl("cpu_causal_conv1d_update", torch::kCPU,
+           &causal_conv1d_update_cpu);
+  ops.def(
+      "cpu_chunk_gated_delta_rule(Tensor query, Tensor key, Tensor value, "
+      "Tensor g, Tensor beta, Tensor initial_state, bool output_final_state, "
+      "Tensor cu_seqlens, bool head_first, bool use_qk_l2norm_in_kernel) -> "
+      "(Tensor, Tensor)");
+  ops.impl("cpu_chunk_gated_delta_rule", torch::kCPU,
+           &chunk_gated_delta_rule_cpu);
+  ops.def(
+      "cpu_fused_sigmoid_gating_delta_rule_update(Tensor A_log, Tensor "
+      "dt_bias, Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a7!) "
+      "initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, "
+      "bool use_qk_l2norm_in_kernel) -> Tensor");
+  ops.impl("cpu_fused_sigmoid_gating_delta_rule_update", torch::kCPU,
+           &fused_sigmoid_gating_delta_rule_update_cpu);
+  ops.def(
+      "cpu_fused_gdn_gating(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) "
+      "-> (Tensor, Tensor)");
+  ops.impl("cpu_fused_gdn_gating", torch::kCPU, &fused_gdn_gating_cpu);
+#endif
 
   // placeholders
   ops.def("static_scaled_fp8_quant() -> ()", placeholder_op);

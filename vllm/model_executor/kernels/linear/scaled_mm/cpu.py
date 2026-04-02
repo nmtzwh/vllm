@@ -1,20 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
+import math
 import torch
+import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    per_tensor_dequantize,
+)
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
 )
-from vllm.model_executor.layers.utils import check_cpu_sgl_kernel
+from vllm.model_executor.layers.utils import (
+    check_cpu_sgl_fp8_linear_kernel,
+    check_cpu_sgl_kernel,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 
 from .ScaledMMLinearKernel import (
+    FP8ScaledMMLinearKernel,
+    FP8ScaledMMLinearLayerConfig,
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
 )
@@ -215,3 +224,115 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
             x.dtype,
             True,
         )
+
+
+class CPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not current_platform.is_cpu():
+            return False, "requires CPU."
+        return True, None
+
+    @classmethod
+    def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        return True, None
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight, weight_scale, _, _ = self._get_layer_params(layer)
+        x_2d = x.view(-1, x.shape[-1])
+        if weight.shape[1] != x_2d.shape[1] and weight.shape[0] == x_2d.shape[1]:
+            weight = weight.t()
+        output_shape = [*x.shape[:-1], weight.shape[0]]
+        out_dtype = x.dtype if self.config.out_dtype is None else self.config.out_dtype
+
+        if self._can_use_cpu_sgl_fp8(layer, weight, weight_scale):
+            block_n = self._get_block_size_n(weight)
+            block_k = 128
+            scales2 = self._expand_scales_for_sgl(weight_scale, weight.shape[1])
+            output = torch.ops._C.fp8_scaled_mm(
+                x_2d,
+                weight,
+                scales2,
+                [block_n, block_k],
+                bias,
+                out_dtype,
+                False,
+            )
+            return output.view(*output_shape)
+
+        weight_bf16 = self._get_or_make_bf16_weight(layer, weight, weight_scale)
+        return F.linear(x, weight_bf16, bias).to(out_dtype)
+
+    def apply_scaled_mm(
+        self,
+        x_q: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "CPUFP8ScaledMMLinearKernel overrides apply_weights directly."
+        )
+
+    def _can_use_cpu_sgl_fp8(
+        self,
+        layer: torch.nn.Module,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> bool:
+        if not (
+            current_platform.get_cpu_architecture() == CpuArchEnum.X86
+            and envs.VLLM_CPU_SGL_KERNEL
+            and hasattr(torch.ops._C, "fp8_scaled_mm")
+        ):
+            return False
+
+        if weight_scale.numel() != 1:
+            return False
+
+        n, k = weight.shape
+        block_n = self._get_block_size_n(weight)
+        return check_cpu_sgl_fp8_linear_kernel(n, k, weight.dtype, block_n, 128)
+
+    @staticmethod
+    def _get_block_size_n(weight: torch.Tensor) -> int:
+        n = int(weight.shape[0])
+        return int(math.ceil(n / 32.0) * 32)
+
+    @staticmethod
+    def _expand_scales_for_sgl(weight_scale: torch.Tensor, k: int) -> torch.Tensor:
+        scale_value = float(weight_scale.reshape(-1)[0].item())
+        num_k_blocks = math.ceil(int(k) / 128)
+        return torch.full(
+            (1, num_k_blocks),
+            scale_value,
+            device=weight_scale.device,
+            dtype=torch.float32,
+        )
+
+    def _get_or_make_bf16_weight(
+        self,
+        layer: torch.nn.Module,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        cached = getattr(layer, "_cpu_fp8_weight_bf16", None)
+        if cached is not None:
+            return cached
+
+        if weight_scale.numel() == 1:
+            weight_bf16 = per_tensor_dequantize(weight, weight_scale.reshape(-1)[0])
+        elif weight_scale.ndim == 2 and weight_scale.shape[1] == 1:
+            weight_bf16 = weight.to(torch.float16) * weight_scale.to(torch.float16)
+        else:
+            weight_bf16 = weight.to(torch.float16) * weight_scale.to(torch.float16)
+
+        layer._cpu_fp8_weight_bf16 = weight_bf16.to(torch.bfloat16)
+        return layer._cpu_fp8_weight_bf16

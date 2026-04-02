@@ -4,9 +4,16 @@
 from typing import TYPE_CHECKING, Literal
 
 import torch
+import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    get_fp8_min_max,
+    group_broadcast,
+    prep_scale_for_group_broadcast,
+)
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
 from vllm.utils.flashinfer import (
@@ -15,6 +22,8 @@ from vllm.utils.flashinfer import (
 from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
+_FP8_MIN, _FP8_MAX = get_fp8_min_max()
+_FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
 
 current_platform.import_kernels()
 
@@ -1930,6 +1939,17 @@ def scaled_fp8_quant(
         assert num_token_padding is None, "padding not supported if output passed in"
         assert output.dtype == out_dtype
 
+    if current_platform.is_cpu():
+        return _scaled_fp8_quant_cpu_fallback(
+            input=input,
+            scale=scale,
+            num_token_padding=num_token_padding,
+            scale_ub=scale_ub,
+            use_per_token_if_dynamic=use_per_token_if_dynamic,
+            output=output,
+            group_shape=group_shape,
+        )
+
     if scale is None:
         if use_per_token_if_dynamic:
             scale = torch.empty((shape[0], 1), device=input.device, dtype=torch.float32)
@@ -1943,6 +1963,53 @@ def scaled_fp8_quant(
         torch.ops._C.static_scaled_fp8_quant(output, input, scale, group_shape)
 
     return output, scale
+
+
+def _scaled_fp8_quant_cpu_fallback(
+    input: torch.Tensor,
+    scale: torch.Tensor | None = None,
+    num_token_padding: int | None = None,
+    scale_ub: torch.Tensor | None = None,
+    use_per_token_if_dynamic: bool = False,
+    output: torch.Tensor | None = None,
+    group_shape: tuple[int, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert input.ndim == 2
+
+    out_dtype: torch.dtype = current_platform.fp8_dtype()
+    shape: tuple[int, int] | torch.Size = input.shape
+    if num_token_padding:
+        shape = (max(num_token_padding, input.shape[0]), shape[1])
+
+    if scale is None:
+        if use_per_token_if_dynamic:
+            x_max, _ = input.abs().max(dim=-1)
+            scale = x_max.unsqueeze(-1).to(torch.float32) / _FP8_MAX
+            if scale_ub is not None:
+                scale = scale.clamp(max=scale_ub)
+        else:
+            scale = (input.abs().max().unsqueeze(-1).to(torch.float32) / _FP8_MAX)
+        scale = scale.clamp(min=_FP8_MIN_SCALING_FACTOR)
+    else:
+        group_shape = GroupShape.PER_TENSOR if group_shape is None else GroupShape(*group_shape)
+        scale = prep_scale_for_group_broadcast(scale, input, group_shape)
+
+    quant = (
+        input.to(torch.float32)
+        * group_broadcast(scale.to(torch.float32), input.shape[-2:]).reciprocal()
+    )
+    quant = quant.clamp(_FP8_MIN, _FP8_MAX).to(out_dtype)
+
+    if num_token_padding is not None:
+        padding = max(num_token_padding - quant.size(0), 0)
+        quant = F.pad(quant, (0, 0, 0, padding), "constant", 0.0)
+
+    if output is not None:
+        assert num_token_padding is None, "padding not supported if output passed in"
+        output.copy_(quant)
+        quant = output
+
+    return quant, scale
 
 
 # gptq allspark
@@ -3040,6 +3107,23 @@ if hasattr(torch.ops._C, "int8_scaled_mm_with_quant"):
         M = mat1.size(0)
         N = mat2.size(0)
         return torch.empty((M, N), dtype=out_dtype)
+
+
+if hasattr(torch.ops._C, "fp8_scaled_mm"):
+
+    @register_fake("_C::fp8_scaled_mm")
+    def fp8_scaled_mm_fake(
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        scales2: torch.Tensor,
+        block_size: list[int],
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        is_vnni: bool,
+    ) -> torch.Tensor:
+        m = mat1.size(0)
+        n = mat2.size(0)
+        return torch.empty((m, n), dtype=out_dtype)
 
 
 class CPUDNNLGEMMHandler:

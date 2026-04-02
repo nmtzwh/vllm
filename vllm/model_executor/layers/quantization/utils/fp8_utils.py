@@ -403,6 +403,15 @@ class W8A8BlockFp8LinearOp:
         output_shape = [*input.shape[:-1], weight.shape[0]]
         output_dtype = input.dtype
 
+        if current_platform.is_cpu():
+            if hasattr(torch.ops._C, "fp8_scaled_mm") and self._cpu_sgl_supported(weight):
+                output = self._run_cpu(input_2d, weight, weight_scale)
+            else:
+                output = self._run_cpu_fallback(input_2d, weight, weight_scale)
+            if bias is not None:
+                output = output + bias
+            return output.to(dtype=input.dtype).view(*output_shape)
+
         if should_use_flashinfer_for_blockscale_fp8_gemm(
             self.is_flashinfer_supported, output_dtype, input_2d, weight
         ) and should_use_deepgemm_for_fp8_linear(
@@ -422,6 +431,49 @@ class W8A8BlockFp8LinearOp:
         if bias is not None:
             output = output + bias
         return output.to(dtype=input.dtype).view(*output_shape)
+
+    def _cpu_sgl_supported(self, weight: torch.Tensor) -> bool:
+        block_n, block_k = tuple(self.weight_group_shape)
+        return (
+            current_platform.is_cpu()
+            and envs.VLLM_CPU_SGL_KERNEL
+            and current_platform.get_cpu_architecture().name == "X86"
+            and block_k == 128
+            and block_n % 32 == 0
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.shape[0] % 32 == 0
+            and weight.shape[1] % 128 == 0
+        )
+
+    def _run_cpu(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops._C.fp8_scaled_mm(
+            input_2d,
+            weight,
+            weight_scale.to(torch.float32),
+            list(self.weight_group_shape),
+            None,
+            input_2d.dtype,
+            False,
+        )
+
+    def _run_cpu_fallback(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        block_n, block_k = tuple(self.weight_group_shape)
+        n, k = weight.shape
+        row_block_ids = torch.arange(n, device=weight.device) // block_n
+        col_block_ids = torch.arange(k, device=weight.device) // block_k
+        block_scales = weight_scale[row_block_ids][:, col_block_ids]
+        weight_bf16 = weight.to(torch.float16) * block_scales.to(torch.float16)
+        return torch.nn.functional.linear(input_2d, weight_bf16.to(torch.bfloat16))
 
     def _run_deepgemm(
         self,

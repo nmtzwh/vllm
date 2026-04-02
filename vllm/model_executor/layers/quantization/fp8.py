@@ -285,6 +285,8 @@ class Fp8LinearMethod(LinearMethodBase):
             not current_platform.has_device_capability(89)
             or envs.VLLM_TEST_FORCE_FP8_MARLIN
         )
+        if current_platform.is_cpu():
+            self.use_marlin = False
         # Disable marlin for rocm
         if current_platform.is_rocm() or current_platform.is_xpu():
             self.use_marlin = False
@@ -426,7 +428,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 if self.act_q_static:
                     assert input_scale is not None
                     input_scale = input_scale.max()
-            weight = weight.t()
+            if not current_platform.is_cpu():
+                weight = weight.t()
 
             # Update layer with new values.
             replace_parameter(layer, "weight", weight.data)
@@ -437,7 +440,7 @@ class Fp8LinearMethod(LinearMethodBase):
         else:
             layer.input_scale = None
 
-        if self.use_marlin:
+        if self.use_marlin and not current_platform.is_cpu():
             prepare_fp8_layer_for_marlin(
                 layer, size_k_first, input_dtype=self.marlin_input_dtype
             )
@@ -490,7 +493,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         weight_bf16 = weight_fp8 * weight_scale
                 return torch.nn.functional.linear(x, weight_bf16.t(), bias)
 
-        if self.use_marlin:
+        if self.use_marlin and not current_platform.is_cpu():
             if self.block_quant:
                 weight_scale = layer.weight_scale_inv
             else:
@@ -634,7 +637,7 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
         replace_parameter(layer, "weight", weight.data)
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
-        if self.use_marlin:
+        if self.use_marlin and not current_platform.is_cpu():
             size_k_first = True
             prepare_fp8_layer_for_marlin(
                 layer, size_k_first, input_dtype=self.marlin_input_dtype
@@ -679,13 +682,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 else kFp8DynamicTensorSym
             )
 
-        # Select Fp8 MoE backend
-        self.fp8_backend, self.experts_cls = select_fp8_moe_backend(
-            config=self.moe,
-            weight_key=weight_key,
-            activation_key=activation_key,
-            allow_vllm_cutlass=False,
-        )
+        if current_platform.is_cpu():
+            self.fp8_backend = None
+            self.experts_cls = None
+            self.cpu_fused_moe = None
+        else:
+            # Select Fp8 MoE backend
+            self.fp8_backend, self.experts_cls = select_fp8_moe_backend(
+                config=self.moe,
+                weight_key=weight_key,
+                activation_key=activation_key,
+                allow_vllm_cutlass=False,
+            )
 
     def create_weights(
         self,
@@ -913,10 +921,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
 
-        # Shuffle weights to runtime format and setup kernel.
-        self._setup_kernel(
-            layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
-        )
+        if current_platform.is_cpu():
+            from vllm.model_executor.layers.fused_moe import cpu_fused_moe
+
+            self.cpu_fused_moe = cpu_fused_moe.CPUFP8FusedMOE(
+                layer=layer,
+                w13=w13,
+                w2=w2,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                block_shape=self.weight_block_size,
+                w13_scale_attr=f"w13_{self.weight_scale_name}",
+                w2_scale_attr=f"w2_{self.weight_scale_name}",
+            )
+        else:
+            # Shuffle weights to runtime format and setup kernel.
+            self._setup_kernel(
+                layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
+            )
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
@@ -930,7 +952,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "logic. This function should not be called."
         )
 
-    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        if current_platform.is_cpu():
+            return None
+
         w1_scale = getattr(layer, f"w13_{self.weight_scale_name}")
         w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
         a1_scale = layer.w13_input_scale
@@ -967,6 +994,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if current_platform.is_cpu():
+            raise NotImplementedError("CPU FP8 MoE does not use monolithic execution.")
         assert self.is_monolithic
         assert self.moe_kernel is not None
         return self.moe_kernel.apply_monolithic(
@@ -993,6 +1022,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert not self.is_monolithic
+        if current_platform.is_cpu():
+            assert self.cpu_fused_moe is not None
+            return self.cpu_fused_moe(
+                layer=layer,
+                x=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            )
+
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             x,

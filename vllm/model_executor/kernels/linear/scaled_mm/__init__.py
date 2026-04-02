@@ -5,6 +5,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
     AiterInt8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
+    CPUFP8ScaledMMLinearKernel,
     CPUInt8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
@@ -42,6 +43,7 @@ __all__ = [
     "ScaledMMLinearKernel",
     "ScaledMMLinearLayerConfig",
     "AiterInt8ScaledMMLinearKernel",
+    "CPUFP8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",
     "CutlassInt8ScaledMMLinearKernel",

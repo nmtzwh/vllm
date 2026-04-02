@@ -79,6 +79,12 @@ at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2,
                                      const std::optional<at::Tensor>& bias,
                                      at::ScalarType out_dtype, bool is_vnni);
 
+at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
+                             at::Tensor& scales2,
+                             std::vector<int64_t> block_size,
+                             const std::optional<at::Tensor>& bias,
+                             at::ScalarType out_dtype, bool is_vnni);
+
 torch::Tensor get_scheduler_metadata(
     const int64_t num_req, const int64_t num_heads_q,
     const int64_t num_heads_kv, const int64_t head_dim,
@@ -106,7 +112,24 @@ void cpu_attention_with_kv_cache(
     const std::optional<torch::Tensor>& s_aux);
 
 // Note: just for avoiding importing errors
-void placeholder_op() { TORCH_CHECK(false, "Unimplemented"); }
+void static_scaled_fp8_quant_placeholder(
+    torch::Tensor& result, const torch::Tensor& input, const torch::Tensor& scale,
+    const std::optional<std::tuple<int64_t, int64_t>>& group_shape) {
+  TORCH_CHECK(false, "CPU static_scaled_fp8_quant kernel is not implemented");
+}
+
+void dynamic_scaled_fp8_quant_placeholder(
+    torch::Tensor& result, const torch::Tensor& input, torch::Tensor& scale) {
+  TORCH_CHECK(false, "CPU dynamic_scaled_fp8_quant kernel is not implemented");
+}
+
+void dynamic_per_token_scaled_fp8_quant_placeholder(
+    torch::Tensor& result, const torch::Tensor& input, torch::Tensor& scale,
+    const std::optional<torch::Tensor>& scale_ub) {
+  TORCH_CHECK(
+      false,
+      "CPU dynamic_per_token_scaled_fp8_quant kernel is not implemented");
+}
 
 void cpu_gemm_wna16(const torch::Tensor& input, const torch::Tensor& q_weight,
                     torch::Tensor& output, const torch::Tensor& scales,
@@ -294,7 +317,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif  // #if defined(__AVX512F__) || defined(__aarch64__)
 
   // sgl-kernels
-#if defined(__AVX512BF16__) && defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(CPU_CAPABILITY_AMXBF16)
   ops.def(
       "weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? "
       "bias, bool is_vnni) -> Tensor");
@@ -313,6 +336,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");
   ops.impl("int8_scaled_mm_with_quant", torch::kCPU,
            &int8_scaled_mm_with_quant);
+  ops.def(
+      "fp8_scaled_mm(Tensor mat1, Tensor mat2, Tensor scales2, SymInt[] "
+      "block_size, Tensor? bias, ScalarType out_dtype, bool is_vnni) -> "
+      "Tensor");
+  ops.impl("fp8_scaled_mm", torch::kCPU, &fp8_scaled_mm_cpu);
 #endif
 
   // CPU attention kernels
@@ -369,9 +397,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif
 
   // placeholders
-  ops.def("static_scaled_fp8_quant() -> ()", placeholder_op);
-  ops.def("dynamic_scaled_fp8_quant() -> ()", placeholder_op);
-  ops.def("dynamic_per_token_scaled_fp8_quant() -> ()", placeholder_op);
+  ops.def(
+      "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale, "
+      "(int, int)? group_shape=None) -> ()",
+      static_scaled_fp8_quant_placeholder);
+  ops.def(
+      "dynamic_scaled_fp8_quant(Tensor! result, Tensor input, Tensor! scale) "
+      "-> ()",
+      dynamic_scaled_fp8_quant_placeholder);
+  ops.def(
+      "dynamic_per_token_scaled_fp8_quant(Tensor! result, Tensor input, "
+      "Tensor! scale, Tensor? scale_ub) -> ()",
+      dynamic_per_token_scaled_fp8_quant_placeholder);
 
   // WNA16
 #if defined(__AVX512F__)

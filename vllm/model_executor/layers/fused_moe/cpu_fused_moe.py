@@ -10,7 +10,11 @@ from vllm import _custom_ops as ops
 from vllm._custom_ops import cpu_fused_moe, cpu_prepack_moe_weight
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    per_tensor_dequantize,
+)
 from vllm.model_executor.layers.quantization.utils.layer_utils import replace_parameter
+from vllm.model_executor.layers.utils import check_cpu_sgl_fp8_moe_kernel
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _CPU_MOE_LAYER_CACHE = {}
@@ -199,6 +203,164 @@ class SGLFusedMOE:
             None,
             None,
             None,
+            None,
+            None,
+            True,
+        )
+        return x
+
+
+def _dequantize_block_fp8_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_shape: list[int] | tuple[int, int],
+) -> torch.Tensor:
+    block_n, block_k = int(block_shape[0]), int(block_shape[1])
+    n, k = weight.shape
+    row_block_ids = torch.arange(n, device=weight.device) // block_n
+    col_block_ids = torch.arange(k, device=weight.device) // block_k
+    block_scales = scale[row_block_ids][:, col_block_ids]
+    return weight.to(torch.float16) * block_scales.to(torch.float16)
+
+
+class CPUFP8FusedMOE:
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        block_shape: list[int] | None,
+        w13_scale_attr: str,
+        w2_scale_attr: str,
+    ) -> None:
+        self.block_shape = block_shape
+        self.w13_scale_attr = w13_scale_attr
+        self.w2_scale_attr = w2_scale_attr
+        self.supports_fp8_grouped_gemm = self._supports_fp8_grouped_gemm(
+            layer, w13, w2
+        )
+
+        if self.supports_fp8_grouped_gemm:
+            replace_parameter(layer, "w13_weight", cpu_prepack_moe_weight(w13, "amx"))
+            replace_parameter(layer, "w2_weight", cpu_prepack_moe_weight(w2, "amx"))
+            replace_parameter(layer, self.w13_scale_attr, w13_scale)
+            replace_parameter(layer, self.w2_scale_attr, w2_scale)
+            self.fallback = None
+        else:
+            replace_parameter(
+                layer,
+                "w13_weight",
+                self._dequantize_moe_weight(w13, w13_scale, True).to(torch.bfloat16),
+            )
+            replace_parameter(
+                layer,
+                "w2_weight",
+                self._dequantize_moe_weight(w2, w2_scale, False).to(torch.bfloat16),
+            )
+            self.fallback = CPUFusedMOE(layer)
+
+    def _supports_fp8_grouped_gemm(
+        self,
+        layer: torch.nn.Module,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+    ) -> bool:
+        if not (
+            hasattr(torch.ops._C, "fused_experts_cpu")
+            and envs.VLLM_CPU_SGL_KERNEL
+            and torch._C._cpu._is_amx_tile_supported()
+        ):
+            return False
+
+        if getattr(layer, "w13_bias", None) is not None or getattr(layer, "w2_bias", None) is not None:
+            return False
+
+        if self.block_shape is None:
+            return False
+
+        return (
+            check_cpu_sgl_fp8_moe_kernel(w13.dtype, self.block_shape)
+            and check_cpu_sgl_fp8_moe_kernel(w2.dtype, self.block_shape)
+            and w13.size(1) % 32 == 0
+            and w2.size(1) % 32 == 0
+        )
+
+    def _dequantize_moe_weight(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        is_w13: bool,
+    ) -> torch.Tensor:
+        if self.block_shape is not None and scale.ndim == 3:
+            experts = [
+                _dequantize_block_fp8_weight(weight[i], scale[i], self.block_shape)
+                for i in range(weight.size(0))
+            ]
+            return torch.stack(experts, dim=0)
+
+        if scale.ndim == 1:
+            experts = [
+                per_tensor_dequantize(weight[i], scale[i]) for i in range(weight.size(0))
+            ]
+            return torch.stack(experts, dim=0)
+
+        if scale.ndim == 2 and is_w13:
+            shard_size = weight.size(1) // 2
+            experts = []
+            for i in range(weight.size(0)):
+                w1 = per_tensor_dequantize(weight[i, :shard_size, :], scale[i, 0])
+                w3 = per_tensor_dequantize(weight[i, shard_size:, :], scale[i, 1])
+                experts.append(torch.cat((w1, w3), dim=0))
+            return torch.stack(experts, dim=0)
+
+        if scale.ndim == 2 and scale.shape[1] == 1:
+            experts = [
+                per_tensor_dequantize(weight[i], scale[i, 0])
+                for i in range(weight.size(0))
+            ]
+            return torch.stack(experts, dim=0)
+
+        return weight.to(torch.float16)
+
+    def __call__(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int = -1,
+        apply_router_weight_on_input: bool = False,
+    ) -> torch.Tensor:
+        if self.fallback is not None:
+            return self.fallback.forward_method(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                apply_router_weight_on_input,
+            )
+
+        assert activation == MoEActivation.SILU, f"{activation} is not supported."
+        assert not apply_router_weight_on_input
+        assert self.block_shape is not None
+
+        torch.ops._C.fused_experts_cpu(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            True,
+            False,
+            True,
+            getattr(layer, self.w13_scale_attr),
+            getattr(layer, self.w2_scale_attr),
+            self.block_shape,
             None,
             None,
             True,

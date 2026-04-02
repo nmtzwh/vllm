@@ -62,6 +62,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
     AiterInt8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
+    CPUFP8ScaledMMLinearKernel,
     CPUInt8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
@@ -115,6 +116,7 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         ChannelWiseTorchFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.CPU: [
+        CPUFP8ScaledMMLinearKernel,
         PerTensorTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
     ],
@@ -372,6 +374,7 @@ __all__ = [
     "Int8ScaledMMLinearLayerConfig",
     "ScaledMMLinearLayerConfig",
     "AiterInt8ScaledMMLinearKernel",
+    "CPUFP8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",
     "CutlassInt8ScaledMMLinearKernel",

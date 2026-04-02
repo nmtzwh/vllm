@@ -219,6 +219,39 @@ def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     )
 
 
+def check_cpu_sgl_fp8_linear_kernel(
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+    block_n: int,
+    block_k: int,
+) -> bool:
+    return (
+        torch._C._cpu._is_amx_tile_supported()
+        and dtype == torch.float8_e4m3fn
+        and block_k == 128
+        and block_n % 32 == 0
+        and n % 32 == 0
+        and k % 128 == 0
+    )
+
+
+def check_cpu_sgl_fp8_moe_kernel(
+    dtype: torch.dtype,
+    block_size: list[int] | tuple[int, int] | None,
+) -> bool:
+    if block_size is None or len(block_size) != 2:
+        return False
+
+    block_n, block_k = int(block_size[0]), int(block_size[1])
+    return (
+        torch._C._cpu._is_amx_tile_supported()
+        and dtype == torch.float8_e4m3fn
+        and block_k == 128
+        and block_n % 32 == 0
+    )
+
+
 def dispatch_cpu_unquantized_gemm(
     layer: torch.nn.Module,
     remove_weight: bool,

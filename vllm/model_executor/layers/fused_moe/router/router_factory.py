@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
 from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
     RoutingSimulatorRouter,
 )
+from vllm.platforms import current_platform
 
 EMPTY_EPLB_STATE: EplbLayerState = EplbLayerState()
 
@@ -96,6 +97,39 @@ def create_fused_moe_router(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
+            enable_eplb=enable_eplb,
+            indices_type_getter=indices_type_getter,
+        )
+
+    if current_platform.is_cpu():
+        from vllm.model_executor.layers.fused_moe import cpu_fused_moe
+
+        def cpu_routing_function(
+            hidden_states: torch.Tensor,
+            gating_output: torch.Tensor,
+            topk: int,
+            renormalize: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return cpu_fused_moe.select_experts(
+                hidden_states=hidden_states,
+                router_logits=gating_output,
+                top_k=topk,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias,
+            )
+
+        return CustomRoutingRouter(
+            top_k=top_k,
+            global_num_experts=global_num_experts,
+            eplb_state=eplb_state,
+            custom_routing_function=cpu_routing_function,
+            renormalize=renormalize,
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
         )

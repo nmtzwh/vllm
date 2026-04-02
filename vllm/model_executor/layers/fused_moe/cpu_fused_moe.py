@@ -6,6 +6,7 @@ from collections.abc import Callable
 import torch
 from torch.nn import functional as F
 
+from vllm import envs
 from vllm import _custom_ops as ops
 from vllm._custom_ops import cpu_fused_moe, cpu_prepack_moe_weight
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -243,8 +244,16 @@ class CPUFP8FusedMOE:
         )
 
         if self.supports_fp8_grouped_gemm:
-            replace_parameter(layer, "w13_weight", cpu_prepack_moe_weight(w13, "amx"))
-            replace_parameter(layer, "w2_weight", cpu_prepack_moe_weight(w2, "amx"))
+            replace_parameter(
+                layer,
+                "w13_weight",
+                torch.ops._C.convert_weight_packed(w13),
+            )
+            replace_parameter(
+                layer,
+                "w2_weight",
+                torch.ops._C.convert_weight_packed(w2),
+            )
             replace_parameter(layer, self.w13_scale_attr, w13_scale)
             replace_parameter(layer, self.w2_scale_attr, w2_scale)
             self.fallback = None
@@ -269,6 +278,7 @@ class CPUFP8FusedMOE:
     ) -> bool:
         if not (
             hasattr(torch.ops._C, "fused_experts_cpu")
+            and hasattr(torch.ops._C, "convert_weight_packed")
             and envs.VLLM_CPU_SGL_KERNEL
             and torch._C._cpu._is_amx_tile_supported()
         ):

@@ -247,23 +247,36 @@ class CPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> torch.Tensor:
         weight, weight_scale, _, _ = self._get_layer_params(layer)
         x_2d = x.view(-1, x.shape[-1])
-        if weight.shape[1] != x_2d.shape[1] and weight.shape[0] == x_2d.shape[1]:
+        weight_shape = getattr(layer, "_cpu_fp8_weight_shape", None)
+        if weight_shape is not None:
+            n, k = int(weight_shape[0]), int(weight_shape[1])
+        elif weight.shape[1] != x_2d.shape[1] and weight.shape[0] == x_2d.shape[1]:
             weight = weight.t()
-        output_shape = [*x.shape[:-1], weight.shape[0]]
+            n, k = int(weight.shape[0]), int(weight.shape[1])
+        else:
+            n, k = int(weight.shape[0]), int(weight.shape[1])
+        output_shape = [*x.shape[:-1], n]
         out_dtype = x.dtype if self.config.out_dtype is None else self.config.out_dtype
 
         if self._can_use_cpu_sgl_fp8(layer, weight, weight_scale):
-            block_n = self._get_block_size_n(weight)
+            block_n = self._get_block_size_n(layer, weight)
             block_k = 128
-            scales2 = self._expand_scales_for_sgl(weight_scale, weight.shape[1])
+            scales2 = getattr(layer, "_cpu_fp8_scales2", None)
+            if scales2 is None:
+                scales2 = self._expand_scales_for_sgl(weight_scale, k)
+            sgl_bias = None
+            if bias is not None:
+                sgl_bias = getattr(layer, "bias_fp32", None)
+                if sgl_bias is None:
+                    sgl_bias = bias.float()
             output = torch.ops._C.fp8_scaled_mm(
                 x_2d,
                 weight,
                 scales2,
                 [block_n, block_k],
-                bias,
+                sgl_bias,
                 out_dtype,
-                False,
+                bool(getattr(weight, "is_vnni_weight", False)),
             )
             return output.view(*output_shape)
 
@@ -297,13 +310,18 @@ class CPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if weight_scale.numel() != 1:
             return False
 
-        n, k = weight.shape
-        block_n = self._get_block_size_n(weight)
+        weight_shape = getattr(layer, "_cpu_fp8_weight_shape", None)
+        if weight_shape is None:
+            n, k = int(weight.shape[0]), int(weight.shape[1])
+        else:
+            n, k = int(weight_shape[0]), int(weight_shape[1])
+        block_n = self._get_block_size_n(layer, weight)
         return check_cpu_sgl_fp8_linear_kernel(n, k, weight.dtype, block_n, 128)
 
     @staticmethod
-    def _get_block_size_n(weight: torch.Tensor) -> int:
-        n = int(weight.shape[0])
+    def _get_block_size_n(layer: torch.nn.Module, weight: torch.Tensor) -> int:
+        weight_shape = getattr(layer, "_cpu_fp8_weight_shape", None)
+        n = int(weight_shape[0]) if weight_shape is not None else int(weight.shape[0])
         return int(math.ceil(n / 32.0) * 32)
 
     @staticmethod

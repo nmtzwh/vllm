@@ -458,7 +458,7 @@ class W8A8BlockFp8LinearOp:
             list(self.weight_group_shape),
             None,
             input_2d.dtype,
-            False,
+            bool(getattr(weight, "is_vnni_weight", False)),
         )
 
     def _run_cpu_fallback(

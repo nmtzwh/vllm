@@ -260,6 +260,78 @@ def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
     set_weight_attrs(new, attrs_to_set)
 
 
+def _can_prepack_cpu_fp8_weight(
+    weight: torch.Tensor,
+    block_shape: list[int] | None,
+) -> bool:
+    if not (
+        current_platform.is_cpu()
+        and envs.VLLM_CPU_SGL_KERNEL
+        and hasattr(torch.ops._C, "convert_weight_packed")
+    ):
+        return False
+
+    if current_platform.get_cpu_architecture().name != "X86":
+        return False
+
+    if not torch._C._cpu._is_amx_tile_supported():
+        return False
+
+    if weight.dtype != torch.float8_e4m3fn:
+        return False
+
+    if block_shape is not None:
+        block_n, block_k = int(block_shape[0]), int(block_shape[1])
+    else:
+        block_n, block_k = 32, 128
+
+    return (
+        block_k == 128
+        and block_n % 32 == 0
+        and weight.shape[0] % 32 == 0
+        and weight.shape[1] % 128 == 0
+    )
+
+
+def _maybe_prepack_cpu_fp8_weight(
+    layer: Module,
+    block_shape: list[int] | None,
+) -> None:
+    weight = layer.weight
+    if not _can_prepack_cpu_fp8_weight(weight, block_shape):
+        return
+
+    packed_weight = torch.ops._C.convert_weight_packed(weight)
+    old_weight = weight
+    replace_parameter(layer, "weight", packed_weight.data)
+    _copy_missing_attrs(old_weight, layer.weight)
+    set_weight_attrs(
+        layer.weight,
+        {
+            "is_vnni_weight": True,
+            "weight_shape": tuple(old_weight.shape),
+        },
+    )
+
+    if block_shape is None and hasattr(layer, "weight_scale") and layer.weight_scale is not None:
+        weight_scale = layer.weight_scale
+        if weight_scale.numel() == 1:
+            num_k_blocks = (weight.shape[1] + 127) // 128
+            scales2 = torch.full(
+                (1, num_k_blocks),
+                float(weight_scale.reshape(-1)[0].item()),
+                device=weight_scale.device,
+                dtype=torch.float32,
+            )
+            setattr(layer, "_cpu_fp8_scales2", scales2)
+
+    if getattr(layer, "bias", None) is not None and not hasattr(layer, "bias_fp32"):
+        layer.register_parameter(
+            "bias_fp32",
+            torch.nn.Parameter(layer.bias.float().data, requires_grad=False),
+        )
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -439,6 +511,11 @@ class Fp8LinearMethod(LinearMethodBase):
             replace_parameter(layer, "input_scale", input_scale)
         else:
             layer.input_scale = None
+
+        if current_platform.is_cpu():
+            _maybe_prepack_cpu_fp8_weight(
+                layer, self.weight_block_size if self.block_quant else None
+            )
 
         if self.use_marlin and not current_platform.is_cpu():
             prepare_fp8_layer_for_marlin(
@@ -636,6 +713,9 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
         # Update layer with new values.
         replace_parameter(layer, "weight", weight.data)
         replace_parameter(layer, "weight_scale", weight_scale.data)
+
+        if current_platform.is_cpu():
+            _maybe_prepack_cpu_fp8_weight(layer, None)
 
         if self.use_marlin and not current_platform.is_cpu():
             size_k_first = True
@@ -987,6 +1067,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     @property
     def supports_eplb(self) -> bool:
         return True
+
+    @property
+    def is_monolithic(self) -> bool:
+        if current_platform.is_cpu():
+            return False
+        return super().is_monolithic
 
     def apply_monolithic(
         self,

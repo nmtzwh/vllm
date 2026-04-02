@@ -211,8 +211,15 @@ direct_register_custom_op(
 
 
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
+    arch = current_platform.get_cpu_architecture()
+    if arch == CpuArchEnum.X86:
+        isa_supported = torch._C._cpu._is_amx_tile_supported()
+    elif arch == CpuArchEnum.ARM:
+        isa_supported = True
+    else:
+        isa_supported = False
     return (
-        torch._C._cpu._is_amx_tile_supported()
+        isa_supported
         and (dtype in (torch.bfloat16, torch.int8))
         and k % 32 == 0
         and n % 32 == 0
@@ -226,8 +233,15 @@ def check_cpu_sgl_fp8_linear_kernel(
     block_n: int,
     block_k: int,
 ) -> bool:
+    arch = current_platform.get_cpu_architecture()
+    if arch == CpuArchEnum.X86:
+        isa_supported = torch._C._cpu._is_amx_tile_supported()
+    elif arch == CpuArchEnum.ARM:
+        isa_supported = True
+    else:
+        isa_supported = False
     return (
-        torch._C._cpu._is_amx_tile_supported()
+        isa_supported
         and dtype == torch.float8_e4m3fn
         and block_k == 128
         and block_n % 32 == 0
@@ -244,8 +258,15 @@ def check_cpu_sgl_fp8_moe_kernel(
         return False
 
     block_n, block_k = int(block_size[0]), int(block_size[1])
+    arch = current_platform.get_cpu_architecture()
+    if arch == CpuArchEnum.X86:
+        isa_supported = torch._C._cpu._is_amx_tile_supported()
+    elif arch == CpuArchEnum.ARM:
+        isa_supported = True
+    else:
+        isa_supported = False
     return (
-        torch._C._cpu._is_amx_tile_supported()
+        isa_supported
         and dtype == torch.float8_e4m3fn
         and block_k == 128
         and block_n % 32 == 0
@@ -295,7 +316,12 @@ def dispatch_cpu_unquantized_gemm(
             layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
         return
 
-    if envs.VLLM_CPU_SGL_KERNEL and check_cpu_sgl_kernel(N, K, dtype):
+    if (
+        envs.VLLM_CPU_SGL_KERNEL
+        and hasattr(torch.ops._C, "convert_weight_packed")
+        and hasattr(torch.ops._C, "weight_packed_linear")
+        and check_cpu_sgl_kernel(N, K, dtype)
+    ):
         packed_weight = torch.ops._C.convert_weight_packed(layer.weight)
         if getattr(layer, "bias", None) is not None:
             bias_f32 = layer.bias.to(torch.float32)

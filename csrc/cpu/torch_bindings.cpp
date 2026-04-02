@@ -317,7 +317,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif  // #if defined(__AVX512F__) || defined(__aarch64__)
 
   // sgl-kernels
-#if defined(CPU_CAPABILITY_AMXBF16)
+#if defined(CPU_CAPABILITY_AMXBF16) || defined(SGLANG_WITH_SVE)
   ops.def(
       "weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? "
       "bias, bool is_vnni) -> Tensor");

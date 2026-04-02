@@ -271,10 +271,10 @@ def _can_prepack_cpu_fp8_weight(
     ):
         return False
 
-    if current_platform.get_cpu_architecture().name != "X86":
-        return False
-
-    if not torch._C._cpu._is_amx_tile_supported():
+    if current_platform.get_cpu_architecture() not in (
+        CpuArchEnum.X86,
+        CpuArchEnum.ARM,
+    ):
         return False
 
     if weight.dtype != torch.float8_e4m3fn:

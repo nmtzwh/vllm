@@ -48,8 +48,9 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         dtype = weight.dtype
         N, K = weight.size()
         if (
-            current_platform.get_cpu_architecture() == CpuArchEnum.X86
-            and envs.VLLM_CPU_SGL_KERNEL
+            envs.VLLM_CPU_SGL_KERNEL
+            and hasattr(torch.ops._C, "convert_weight_packed")
+            and hasattr(torch.ops._C, "int8_scaled_mm_with_quant")
             and self.config.input_symmetric
             and check_cpu_sgl_kernel(N, K, dtype)
         ):
@@ -301,7 +302,8 @@ class CPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         weight_scale: torch.Tensor,
     ) -> bool:
         if not (
-            current_platform.get_cpu_architecture() == CpuArchEnum.X86
+            current_platform.get_cpu_architecture()
+            in (CpuArchEnum.X86, CpuArchEnum.ARM)
             and envs.VLLM_CPU_SGL_KERNEL
             and hasattr(torch.ops._C, "fp8_scaled_mm")
         ):

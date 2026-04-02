@@ -1,29 +1,69 @@
 #pragma once
-
 #include <ATen/native/CPUBlas.h>
 
-// clang-format off
+#include "common.h"
+#include "vec.h"
 
-// amx-bf16
+// amx-bf16 (x86 only)
 #define TILE_M 16
 #define TILE_N 16
 #define TILE_K 32
 
 // block size for AMX gemm
-constexpr int block_size_m() { return 2 * TILE_M; }
-constexpr int block_size_n() { return 2 * TILE_N; }
+constexpr int block_size_m() {
+  return 2 * TILE_M;
+}
+constexpr int block_size_n() {
+  return 2 * TILE_N;
+}
 
 // define threshold using brgemm (intel AMX)
-template <typename T> inline bool can_use_brgemm(int M);
-template <> inline bool can_use_brgemm<at::BFloat16>(int M) { return M > 4; }
-template <> inline bool can_use_brgemm<at::Half>(int M) { return true; }
-// TODO: add u8s8 brgemm, this requires PyTorch 2.7
-template <> inline bool can_use_brgemm<int8_t>(int M) { return false; }
-template <> inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) { return M > 4; }
-template <> inline bool can_use_brgemm<at::quint4x2>(int M) { return M > 4; }
+// On aarch64, brgemm is not available (AMX is x86-only),
+// so always fall back to tinygemm intrinsic kernels.
+template <typename T>
+inline bool can_use_brgemm(int M);
+
+#if defined(__aarch64__) || defined(__arm64__)
+// aarch64: always disable brgemm
+template <>
+inline bool can_use_brgemm<at::BFloat16>(int M) {
+  return false;
+}
+template <>
+inline bool can_use_brgemm<at::Half>(int M) {
+  return false;
+}
+template <>
+inline bool can_use_brgemm<int8_t>(int M) {
+  return false;
+}
+template <>
+inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
+  return false;
+}
+#else
+// x86: use brgemm for larger M
+template <>
+inline bool can_use_brgemm<at::BFloat16>(int M) {
+  return M > 4;
+}
+template <>
+inline bool can_use_brgemm<at::Half>(int M) {
+  return true;
+}
+// this requires PyTorch 2.7 or above
+template <>
+inline bool can_use_brgemm<int8_t>(int M) {
+  return false;
+}
+template <>
+inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
+  return M > 4;
+}
+#endif
 
 // work around compiler internal error
-#define BLOCK_K 128 // 4 * TILE_K
+#define BLOCK_K 128  // 4 * TILE_K
 
 // adjust leading dimension size for K
 template <typename T>
@@ -40,8 +80,26 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
+enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3 };
+
+constexpr bool operator==(CPUQuantMethod a, int64_t b) {
+  return static_cast<int64_t>(a) == b;
+}
+
+constexpr bool operator==(int64_t a, CPUQuantMethod b) {
+  return a == static_cast<int64_t>(b);
+}
+
+inline int64_t get_4bit_block_k_size(int64_t group_size) {
+  return group_size > 128 ? 128 : group_size;
+}
+
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
+
+// pack weight to vnni format for int4
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
 
 // moe implementations for int8 w8a8
 template <typename scalar_t>
@@ -97,35 +155,6 @@ void fused_experts_fp8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-// moe implementations for int4 w4a16
-template <typename scalar_t>
-void fused_experts_int4_w4a16_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic0,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ ic2,
-    scalar_t* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
-    float* __restrict__ C_tmp,
-    const scalar_t* __restrict__ input,
-    const at::quint4x2* __restrict__ packed_w1,
-    const at::quint4x2* __restrict__ packed_w2,
-    const uint8_t* __restrict__ w1z,
-    const uint8_t* __restrict__ w2z,
-    const scalar_t* __restrict__ w1s,
-    const scalar_t* __restrict__ w2s,
-    int group_size,
-    const float* __restrict__ topk_weights,
-    const int32_t* __restrict__ sorted_ids,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ offsets,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t E,
-    int64_t topk,
-    int64_t num_tokens_post_pad);
-
 // shared expert implementation for int8 w8a8
 template <typename scalar_t>
 void shared_expert_int8_kernel_impl(
@@ -144,6 +173,37 @@ void shared_expert_int8_kernel_impl(
     int64_t M,
     int64_t N,
     int64_t K);
+
+template <typename scalar_t>
+void fused_experts_int4_w4a8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    uint8_t* __restrict__ A_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    int32_t* __restrict__ Azp_tmp,
+    float* __restrict__ C_tmp,
+    int8_t* __restrict__ dqB_tmp,
+    const scalar_t* __restrict__ input,
+    const uint8_t* __restrict__ packed_w1,
+    const uint8_t* __restrict__ packed_w2,
+    const int8_t* __restrict__ w1z,
+    const int8_t* __restrict__ w2z,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    int group_size,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad);
 
 template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
@@ -211,56 +271,184 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
-    int64_t block_size_K);
+    int64_t block_size_K,
+    bool do_unpack = true);
 
 template <typename scalar_t>
 void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const at::quint4x2* __restrict__ B,
-    scalar_t* __restrict__ C,
-    const uint8_t* __restrict__ Bz,
-    const scalar_t* __restrict__ Bs,
-    scalar_t* __restrict__ Btmp,
-    float* __restrict__ Ctmp,
+    scalar_t* C,
+    float* C_temp,
+    const uint8_t* A,
+    const float* scales_a,
+    const int32_t* qzeros_a,
+    const uint8_t* B,
+    const float* scales_b,
+    const int8_t* qzeros_b,
+    const int32_t* compensation,
+    int8_t* dqB_tmp,
     int64_t M,
-    int64_t N,
     int64_t K,
-    int group_size,
     int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    int64_t strideBz,
-    int64_t strideBs,
-    bool brg);
+    int64_t ldc_f,
+    int64_t ldc_s,
+    bool store_out,
+    bool use_brgemm);
 
-// TODO: debug print, remove me later
-inline void print_16x32i(const __m512i x) {
-  int32_t a[16];
-  _mm512_storeu_si512((__m512i *)a, x);
+// ============================================================================
+// Portable GEMM wrapper
+//
+// Dispatches to brgemm (x86 AMX) or SVE tinygemm (aarch64).
+// Both extend.cpp and fla.cpp call brgemm unconditionally; this wrapper
+// makes them work on aarch64.
+// ============================================================================
 
-  for (int i = 0; i < 16; i++){
-    std::cout << a[i] << " ";
+#if defined(__aarch64__) || defined(__arm64__)
+
+// aarch64: brgemm_release is a no-op
+inline void brgemm_release_portable() {}
+
+#if defined(CPU_CAPABILITY_SVE)
+#include <arm_sve.h>
+#endif
+
+// Portable GEMM: bf16 input, fp32 output
+// A: [M, K] row-major bf16 (raw, not VNNI)
+// B: [K/2, N, 2] VNNI-packed bf16
+// C: [M, N] fp32 output
+template <typename scalar_t>
+inline void gemm_kernel_portable(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C) {
+#if defined(CPU_CAPABILITY_SVE)
+  const uint64_t vl_f32 = svcntw();
+  // B is in VNNI format: [K/2, N, 2] where pairs of bf16 are packed as fp32
+  // We iterate over M rows, and for each row do the full K reduction
+  for (int m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svfloat32_t vc = add_C ? svld1_f32(pg, C + m * ldc + n) : svdup_f32(0.f);
+
+      // K/2 iterations, each processing 2 bf16 elements via bfdot
+      const int K2 = K >> 1;
+      for (int k = 0; k < K2; ++k) {
+        // A is row-major bf16: load 2 consecutive bf16 elements as 1 fp32
+        float a_pair;
+        std::memcpy(&a_pair, reinterpret_cast<const char*>(A + m * lda + k * 2), sizeof(float));
+        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_pair));
+
+        // B is VNNI: [K/2, ldb, 2], offset = k * ldb * 2 (in bf16 units) = k * ldb (in fp32 units)
+        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(B) + k * ldb + n));
+        vc = svbfdot_f32(vc, va, vb);
+      }
+      svst1_f32(pg, C + m * ldc + n, vc);
+    }
   }
-  std::cout << std::endl;
+#else
+  // Scalar fallback
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      float acc = add_C ? C[m * ldc + n] : 0.f;
+      for (int k = 0; k < K; ++k) {
+        float a_val = static_cast<float>(A[m * lda + k]);
+        // Decode VNNI: B[K/2, ldb, 2] -> element at (k, n) is at [(k/2) * ldb * 2 + n * 2 + (k%2)]
+        float b_val = static_cast<float>(B[(k >> 1) * ldb * 2 + n * 2 + (k & 1)]);
+        acc += a_val * b_val;
+      }
+      C[m * ldc + n] = acc;
+    }
+  }
+#endif
 }
 
-inline void print_16x32(const __m512 x) {
-  float a[16];
-  _mm512_storeu_ps((__m512 *)a, x);
-
-  for (int i = 0; i < 16; i++){
-    std::cout << a[i] << " ";
+// Portable GEMM: bf16 input, bf16 output (via fp32 accumulation)
+// Same as above but converts fp32 result to bf16
+template <typename scalar_t>
+inline void gemm_kernel_portable_bf16out(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ C_bf16,
+    int ldc_bf16) {
+  gemm_kernel_portable(M, N, K, lda, ldb, ldc, add_C, A, B, C);
+  // Convert fp32 C to bf16 C_bf16
+#if defined(CPU_CAPABILITY_SVE)
+  const uint64_t vl_f32 = svcntw();
+  for (int m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svfloat32_t vf = svld1_f32(pg, C + m * ldc + n);
+      svbfloat16_t vbf = sve_f32_to_bf16(pg, vf);
+      svst1_bf16(
+          svwhilelt_b16((uint32_t)n, (uint32_t)N), reinterpret_cast<bfloat16_t*>(C_bf16 + m * ldc_bf16 + n), vbf);
+    }
   }
-  std::cout << std::endl;
+#else
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      C_bf16[m * ldc_bf16 + n] = static_cast<scalar_t>(C[m * ldc + n]);
+    }
+  }
+#endif
 }
 
+#else  // x86
 
-inline void print_32x8u(const __m256i x) {
-  uint8_t a[32];
-  _mm256_storeu_si256((__m256i *)a, x);
-
-  for (int i = 0; i < 32; ++i) {
-    std::cout << int32_t(a[i]) << " ";
-  }
-  std::cout << std::endl;
+// x86: direct passthrough to PyTorch brgemm
+inline void brgemm_release_portable() {
+  at::native::cpublas::brgemm_release();
 }
+
+template <typename scalar_t>
+inline void gemm_kernel_portable(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C) {
+  at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, add_C, A, B, C);
+}
+
+template <typename scalar_t>
+inline void gemm_kernel_portable_bf16out(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ C_bf16,
+    int ldc_bf16) {
+  at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, add_C, A, B, C);
+  // On x86, brgemm outputs fp32; convert if needed
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
+  for (int m = 0; m < M; ++m) {
+    sgl_vec::convert(C + m * ldc, C_bf16 + m * ldc_bf16, N);
+  }
+}
+
+#endif  // __aarch64__

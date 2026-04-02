@@ -280,7 +280,6 @@ class CPUFP8FusedMOE:
             hasattr(torch.ops._C, "fused_experts_cpu")
             and hasattr(torch.ops._C, "convert_weight_packed")
             and envs.VLLM_CPU_SGL_KERNEL
-            and torch._C._cpu._is_amx_tile_supported()
         ):
             return False
 

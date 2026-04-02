@@ -19,7 +19,7 @@ pytestmark = [
 ]
 
 
-def _l2norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x / torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True) + eps)
 
 
@@ -67,7 +67,7 @@ def _reference_causal_conv1d_fwd(
     return y.to(x.dtype)
 
 
-def _reference_fused_sigmoid_update(
+def _reference_fused_sigmoid_decode_update(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     q: torch.Tensor,
@@ -79,7 +79,12 @@ def _reference_fused_sigmoid_update(
     initial_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # This CPU kernel is used by vLLM in decode mode, where each sequence
+    # contributes exactly one token and tensors are laid out as [1, B, H, D].
+    # Mirror the SGLang golden reference for that contract instead of assuming
+    # general multi-step recurrence with cu_seqlens support.
     seq_len, batch_size, num_heads, head_dim = q.shape
+    assert seq_len == 1
     v_num_heads = v.size(2)
     v_head_dim = v.size(3)
     group_size = v_num_heads // num_heads
@@ -89,32 +94,31 @@ def _reference_fused_sigmoid_update(
     out = torch.empty((batch_size, seq_len, v_num_heads, v_head_dim), dtype=q.dtype)
 
     for bi, cache_index in enumerate(initial_state_indices.tolist()):
-        for si in range(seq_len):
-            for vi in range(v_num_heads):
-                qi = vi // group_size
-                q_vec = q[si, bi, qi].to(torch.float32)
-                k_vec = k[si, bi, qi].to(torch.float32)
-                if use_qk_l2norm_in_kernel:
-                    q_vec = _l2norm(q_vec)
-                    k_vec = _l2norm(k_vec)
+        for vi in range(v_num_heads):
+            qi = vi // group_size
+            q_vec = q[0, bi, qi].to(torch.float32)
+            k_vec = k[0, bi, qi].to(torch.float32)
+            if use_qk_l2norm_in_kernel:
+                q_vec = _l2norm(q_vec)
+                k_vec = _l2norm(k_vec)
 
-                state = state_ref[cache_index, vi]
-                g_val = -torch.exp(A_log[vi].to(torch.float32)) * torch.nn.functional.softplus(
-                    a[bi, vi].to(torch.float32) + dt_bias[vi].to(torch.float32),
-                    beta=1.0,
-                    threshold=20.0,
-                )
-                g_exp = torch.exp(g_val)
-                scaled_state = state * g_exp
-                kv_mem = (scaled_state * k_vec[:, None]).sum(dim=0)
-                dt = (
-                    v[si, bi, vi].to(torch.float32) - kv_mem
-                ) * torch.sigmoid(b[bi, vi].to(torch.float32))
-                updated_state = scaled_state + k_vec[:, None] * dt[None, :]
-                out[bi, si, vi] = (
-                    (updated_state * q_vec[:, None]).sum(dim=0) * scale
-                ).to(q.dtype)
-                state_ref[cache_index, vi] = updated_state
+            state = state_ref[cache_index, vi]
+            g_val = -torch.exp(A_log[vi].to(torch.float32)) * torch.nn.functional.softplus(
+                a[bi, vi].to(torch.float32) + dt_bias[vi].to(torch.float32),
+                beta=1.0,
+                threshold=20.0,
+            )
+            g_exp = torch.exp(g_val)
+            scaled_state = state * g_exp
+            kv_mem = (scaled_state * k_vec[:, None]).sum(dim=0)
+            dt = (
+                v[0, bi, vi].to(torch.float32) - kv_mem
+            ) * torch.sigmoid(b[bi, vi].to(torch.float32))
+            updated_state = scaled_state + k_vec[:, None] * dt[None, :]
+            out[bi, 0, vi] = (
+                (updated_state * q_vec[:, None]).sum(dim=0) * scale
+            ).to(q.dtype)
+            state_ref[cache_index, vi] = updated_state
 
     return out, state_ref
 
@@ -272,7 +276,7 @@ def test_cpu_chunk_gated_delta_rule_smoke() -> None:
 def test_cpu_fused_sigmoid_gating_delta_rule_update_matches_reference() -> None:
     torch.manual_seed(2)
 
-    seq_len = 2
+    seq_len = 1
     batch = 3
     num_heads = 2
     v_num_heads = 4
@@ -288,14 +292,14 @@ def test_cpu_fused_sigmoid_gating_delta_rule_update_matches_reference() -> None:
     A_log = torch.randn(v_num_heads, dtype=torch.bfloat16)
     dt_bias = torch.randn(v_num_heads, dtype=torch.bfloat16)
     state_indices = torch.tensor([3, 0, 4], dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 2, 4, 6], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
 
     expected_state = torch.randn(
         num_states, v_num_heads, head_dim, v_head_dim, dtype=torch.float32
     )
     actual_state = expected_state.clone()
 
-    expected_out, expected_state = _reference_fused_sigmoid_update(
+    expected_out, expected_state = _reference_fused_sigmoid_decode_update(
         A_log,
         dt_bias,
         q,

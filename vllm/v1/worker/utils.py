@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import math
 from collections import defaultdict
 from collections.abc import Iterable
@@ -191,6 +192,14 @@ class KVBlockZeroer:
         if not block_ids or self._meta is None:
             return
         seg_addrs, page_size_el, blk_size, n_segs = self._meta
+        if self.device.type == "cpu":
+            page_size_bytes = page_size_el * 4
+            seg_addr_list = seg_addrs.tolist()
+            for block_id in block_ids:
+                block_offset_bytes = block_id * page_size_bytes
+                for seg_addr in seg_addr_list:
+                    ctypes.memset(seg_addr + block_offset_bytes, 0, page_size_bytes)
+            return
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2

@@ -856,7 +856,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
         mixed_qkv_non_spec = custom_ops.cpu_causal_conv1d_fwd(
-            mixed_qkv.transpose(0, 1),
+            mixed_qkv.contiguous().transpose(0, 1),
             conv_weights,
             self.conv1d.bias,
             conv_state,

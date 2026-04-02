@@ -3266,6 +3266,15 @@ def cpu_causal_conv1d_fwd(
     pad_slot_id: int,
     is_vnni: bool,
 ) -> torch.Tensor:
+    # CPU kernel expects a transpose-view style layout rather than a contiguous
+    # [B, D, T] / [D, T] tensor. The C++ check is:
+    #   x.stride(-2) == 1 and x.stride(-1) == x.size(-2)
+    assert x.dim() in (2, 3), f"cpu_causal_conv1d_fwd expects 2D/3D x, got {x.dim()}D"
+    assert x.stride(-2) == 1 and x.stride(-1) == x.size(-2), (
+        "cpu_causal_conv1d_fwd expects x to be a transpose-view layout with "
+        "stride(-2) == 1 and stride(-1) == size(-2); use "
+        "x.contiguous().transpose(-2, -1) if needed"
+    )
     return torch.ops._C.cpu_causal_conv1d_fwd(
         x,
         weight,
@@ -3291,6 +3300,12 @@ def cpu_causal_conv1d_update(
     pad_slot_id: int,
     is_vnni: bool,
 ) -> torch.Tensor:
+    # CPU decode/update kernel consumes token-major batches:
+    # - decode: [B, D]
+    # - optional bulk update: [B, D, T]
+    assert x.dim() in (2, 3), (
+        f"cpu_causal_conv1d_update expects 2D/3D x, got {x.dim()}D"
+    )
     return torch.ops._C.cpu_causal_conv1d_update(
         x,
         conv_states,
@@ -3316,6 +3331,17 @@ def cpu_chunk_gated_delta_rule(
     head_first: bool,
     use_qk_l2norm_in_kernel: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # CPU chunked recurrent kernel matches SGLang's extend/prefill contract:
+    # - query/key: [B, T, HK, K]
+    # - value: [B, T, HV, V]
+    # - g/beta: [B, T, HV]
+    assert query.dim() == 4 and key.dim() == 4 and value.dim() == 4, (
+        "cpu_chunk_gated_delta_rule expects q/k/v to be 4D tensors"
+    )
+    assert g.dim() == 3 and beta.dim() == 3, (
+        "cpu_chunk_gated_delta_rule expects g/beta to be 3D tensors"
+    )
+    assert head_first is False, "cpu_chunk_gated_delta_rule does not support head_first=True"
     return torch.ops._C.cpu_chunk_gated_delta_rule(
         query,
         key,
@@ -3343,6 +3369,13 @@ def cpu_fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: torch.Tensor,
     use_qk_l2norm_in_kernel: bool,
 ) -> torch.Tensor:
+    # vLLM uses the CPU fused recurrent kernel in decode mode with:
+    # - q/k: [1, B, HK, K]
+    # - v: [1, B, HV, V]
+    # That matches the original SGLang CPU dispatch contract.
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, (
+        "cpu_fused_sigmoid_gating_delta_rule_update expects q/k/v to be 4D tensors"
+    )
     return torch.ops._C.cpu_fused_sigmoid_gating_delta_rule_update(
         A_log,
         dt_bias,
@@ -3364,6 +3397,12 @@ def cpu_fused_gdn_gating(
     b: torch.Tensor,
     dt_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    assert A_log.dim() == 1 and dt_bias.dim() == 1, (
+        "cpu_fused_gdn_gating expects A_log and dt_bias to be 1D tensors"
+    )
+    assert a.dim() == 2 and b.dim() == 2, (
+        "cpu_fused_gdn_gating expects a and b to be 2D [B, HV] tensors"
+    )
     return torch.ops._C.cpu_fused_gdn_gating(A_log, a, b, dt_bias)
 
 

@@ -122,6 +122,19 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
   }
 
   // OMP threads binding
+  cpu_set_t full_mask;
+  CPU_ZERO(&full_mask);
+  for (const auto& cpu_id : omp_cpu_ids) {
+    CPU_SET(cpu_id, &full_mask);
+  }
+  int ret = sched_setaffinity(0, sizeof(cpu_set_t), &full_mask);
+  if (ret == -1) {
+    TORCH_CHECK(
+        false,
+        "sched_setaffinity failed for process thread mask. errno: " +
+            std::to_string(errno));
+  }
+
   omp_set_num_threads((int)omp_cpu_ids.size());
   torch::set_num_threads((int)omp_cpu_ids.size());
   TORCH_CHECK_EQ(omp_cpu_ids.size(), torch::get_num_threads());
@@ -149,6 +162,14 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
   }
 
   omp_destroy_lock(&writelock);
+
+  ret = sched_setaffinity(0, sizeof(cpu_set_t), &full_mask);
+  if (ret == -1) {
+    TORCH_CHECK(
+        false,
+        "sched_setaffinity failed while restoring process thread mask. errno: " +
+            std::to_string(errno));
+  }
 
   numa_free_nodemask(omp_cpu_mask);
 

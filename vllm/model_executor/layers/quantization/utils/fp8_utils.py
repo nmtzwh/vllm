@@ -15,6 +15,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.utils import check_cpu_sgl_fp8_linear_kernel
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     get_fp8_min_max,
@@ -434,15 +435,17 @@ class W8A8BlockFp8LinearOp:
 
     def _cpu_sgl_supported(self, weight: torch.Tensor) -> bool:
         block_n, block_k = tuple(self.weight_group_shape)
-        return (
+        return bool(
             current_platform.is_cpu()
             and envs.VLLM_CPU_SGL_KERNEL
-            and current_platform.get_cpu_architecture().name == "X86"
-            and block_k == 128
-            and block_n % 32 == 0
-            and weight.dtype == torch.float8_e4m3fn
-            and weight.shape[0] % 32 == 0
-            and weight.shape[1] % 128 == 0
+            and hasattr(torch.ops._C, "fp8_scaled_mm")
+            and check_cpu_sgl_fp8_linear_kernel(
+                int(weight.shape[0]),
+                int(weight.shape[1]),
+                weight.dtype,
+                int(block_n),
+                int(block_k),
+            )
         )
 
     def _run_cpu(

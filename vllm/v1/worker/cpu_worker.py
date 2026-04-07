@@ -105,6 +105,15 @@ class CPUWorker(Worker):
             ret = torch.ops._C.init_cpu_threads_env(self.local_omp_cpuid)
             if ret:
                 logger.info(ret)
+            # Keep auxiliary PyTorch/Inductor helper threads from creating
+            # extra runnable pools on top of the bound OpenMP team.
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                logger.debug(
+                    "torch.set_num_interop_threads already initialized; "
+                    "keeping existing inter-op thread count."
+                )
 
         # Note: unique identifier for creating allreduce shared memory
         os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]

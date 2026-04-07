@@ -258,7 +258,9 @@ class CpuPlatform(Platform):
                     "size_asserts": False,
                     "nan_asserts": False,
                     "epilogue_fusion": True,
-                    "cpp.dynamic_threads": True,
+                    "cpp.dynamic_threads": (
+                        envs.VLLM_CPU_OMP_THREADS_BIND == "nobind"
+                    ),
                 }
             )
 
@@ -282,6 +284,7 @@ class CpuPlatform(Platform):
         if envs.VLLM_CPU_OMP_THREADS_BIND != "nobind":
             # Set default threads num for OpenMP parallel
             os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
+            os.environ["OMP_DYNAMIC"] = "FALSE"
         else:
             # In this case, setting the OpenMP configuration via
             # OMP_NUM_THREADS is up to the user.

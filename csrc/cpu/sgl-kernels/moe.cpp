@@ -1032,6 +1032,129 @@ void shared_expert_kernel_impl(
 
 }  // anonymous namespace
 
+template <typename scalar_t>
+void fused_experts_int4_w4a8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    uint8_t* __restrict__ A_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    int32_t* __restrict__ Azp_tmp,
+    float* __restrict__ C_tmp,
+    int8_t* __restrict__ dqB_tmp,
+    const scalar_t* __restrict__ input,
+    const uint8_t* __restrict__ packed_w1,
+    const uint8_t* __restrict__ packed_w2,
+    const int8_t* __restrict__ w1z,
+    const int8_t* __restrict__ w2z,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    int group_size,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad) {
+  UNUSED(output);
+  UNUSED(ic0);
+  UNUSED(ic1);
+  UNUSED(ic2);
+  UNUSED(A_tmp);
+  UNUSED(Aq_tmp);
+  UNUSED(As_tmp);
+  UNUSED(Azp_tmp);
+  UNUSED(C_tmp);
+  UNUSED(dqB_tmp);
+  UNUSED(input);
+  UNUSED(packed_w1);
+  UNUSED(packed_w2);
+  UNUSED(w1z);
+  UNUSED(w2z);
+  UNUSED(w1s);
+  UNUSED(w2s);
+  UNUSED(group_size);
+  UNUSED(topk_weights);
+  UNUSED(sorted_ids);
+  UNUSED(expert_ids);
+  UNUSED(offsets);
+  UNUSED(M);
+  UNUSED(N);
+  UNUSED(K);
+  UNUSED(E);
+  UNUSED(topk);
+  UNUSED(num_tokens_post_pad);
+  TORCH_CHECK(
+      false,
+      "INT4 W4A8 fused_experts CPU kernel is not available in the vLLM vendored SGL kernels");
+}
+
+template void fused_experts_int4_w4a8_kernel_impl<at::BFloat16>(
+    at::BFloat16* __restrict__,
+    at::BFloat16* __restrict__,
+    at::BFloat16* __restrict__,
+    at::BFloat16* __restrict__,
+    uint8_t* __restrict__,
+    uint8_t* __restrict__,
+    float* __restrict__,
+    int32_t* __restrict__,
+    float* __restrict__,
+    int8_t* __restrict__,
+    const at::BFloat16* __restrict__,
+    const uint8_t* __restrict__,
+    const uint8_t* __restrict__,
+    const int8_t* __restrict__,
+    const int8_t* __restrict__,
+    const float* __restrict__,
+    const float* __restrict__,
+    int,
+    const float* __restrict__,
+    const int32_t* __restrict__,
+    const int32_t* __restrict__,
+    const int32_t* __restrict__,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t);
+
+template void fused_experts_int4_w4a8_kernel_impl<at::Half>(
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    uint8_t* __restrict__,
+    uint8_t* __restrict__,
+    float* __restrict__,
+    int32_t* __restrict__,
+    float* __restrict__,
+    int8_t* __restrict__,
+    const at::Half* __restrict__,
+    const uint8_t* __restrict__,
+    const uint8_t* __restrict__,
+    const int8_t* __restrict__,
+    const int8_t* __restrict__,
+    const float* __restrict__,
+    const float* __restrict__,
+    int,
+    const float* __restrict__,
+    const int32_t* __restrict__,
+    const int32_t* __restrict__,
+    const int32_t* __restrict__,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t);
+
 // common checks
 static inline void check_moe_scales(
     bool use_int8_w8a8,
@@ -1353,6 +1476,47 @@ at::Tensor fused_experts_cpu(
     }
   });
   return out_hidden_states;
+}
+
+at::Tensor fused_experts_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    bool inplace,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<at::Tensor>& a1_scale,
+    const std::optional<at::Tensor>& a2_scale,
+    bool is_vnni) {
+  UNUSED(a1_scale);
+  UNUSED(a2_scale);
+
+  int64_t moe_comp_method = static_cast<int64_t>(CPUQuantMethod::BF16);
+  if (use_int8_w8a8) {
+    moe_comp_method = static_cast<int64_t>(CPUQuantMethod::INT8_W8A8);
+  } else if (use_fp8_w8a16) {
+    moe_comp_method = static_cast<int64_t>(CPUQuantMethod::FP8_W8A16);
+  }
+
+  return fused_experts_cpu(
+      hidden_states,
+      w1,
+      w2,
+      topk_weights,
+      topk_ids,
+      inplace,
+      moe_comp_method,
+      w1_scale,
+      w2_scale,
+      std::nullopt,
+      std::nullopt,
+      block_size,
+      is_vnni);
 }
 
 // shared expert kernel

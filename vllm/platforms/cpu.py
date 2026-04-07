@@ -225,11 +225,19 @@ class CpuPlatform(Platform):
 
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode
+        from vllm.config.vllm import OptimizationLevel
 
         vllm_config.compilation_config.cudagraph_capture_sizes = []
 
         compilation_config = vllm_config.compilation_config
-        if vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+        should_prepare_compile = (
+            vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            or (
+                vllm_config.compilation_config.mode is None
+                and vllm_config.optimization_level > OptimizationLevel.O0
+            )
+        )
+        if should_prepare_compile:
             # Note: vLLM V1 is using PIECEWISE level compilation, which will
             # take time to compile kernels just-in-time with the inductor
             # backend. For CPU CI tests, most of them are executed fast and

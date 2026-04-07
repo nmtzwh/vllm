@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.layer_utils import replace_parameter
 from vllm.model_executor.layers.utils import check_cpu_sgl_fp8_moe_kernel
+from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _CPU_MOE_LAYER_CACHE = {}
@@ -451,7 +452,13 @@ class CPUFusedMOE:
         if not (w13_output_size % 32 == 0 and w2_output_size % 32 == 0):
             return False, "none"
 
-        supports_amx = torch._C._cpu._is_amx_tile_supported()
+        arch = current_platform.get_cpu_architecture()
+        if arch == CpuArchEnum.X86:
+            supports_amx = torch._C._cpu._is_amx_tile_supported()
+        elif arch == CpuArchEnum.ARM:
+            supports_amx = True
+        else:
+            supports_amx = False
 
         if (
             supports_amx

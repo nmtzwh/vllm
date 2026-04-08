@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #ifdef __aarch64__
+  #include "cpu/aarch64/shm.h"
   #include <atomic>
 #endif
 
@@ -16,6 +17,34 @@ static_assert(PER_THREAD_SHM_BUFFER_BYTES % 2 == 0);
 #define PER_THREAD_SHM_BUFFER_OFFSET (PER_THREAD_SHM_BUFFER_BYTES >> 1)
 #define MIN_THREAD_PROCESS_SIZE (256)
 #define MAX_P2P_SEND_TENSOR_NUM 8
+
+#ifdef __aarch64__
+constexpr size_t SHM_ALLREDUCE_MAX_BUF_SIZE = 32 * 1024 * 1024;
+constexpr size_t SHM_ALLREDUCE_THRESHOLD = 1 * 1024 * 1024;
+
+enum class AArch64CollState : int32_t {
+  Begin = 0,
+  AllReduceNaiveCopyInDone,
+  AllReduceNaiveReduceDone,
+  Alt1AllReduceNaiveCopyInDone,
+  Alt2AllReduceNaiveCopyInDone,
+  Alt1AllReduceNaiveReduceDone,
+};
+
+struct alignas(64) AArch64AllreduceWorkspace {
+  std::atomic<int32_t> states[2];
+  char buffer[2 * SHM_ALLREDUCE_THRESHOLD + 2 * SHM_ALLREDUCE_MAX_BUF_SIZE];
+};
+
+constexpr size_t aarch64_buffer0_offset(int current_buffer) {
+  return current_buffer * SHM_ALLREDUCE_THRESHOLD;
+}
+
+constexpr size_t aarch64_buffer1_offset(int current_buffer) {
+  return 2 * SHM_ALLREDUCE_THRESHOLD +
+         current_buffer * SHM_ALLREDUCE_MAX_BUF_SIZE;
+}
+#endif
 
 template <typename scalar_t>
 struct KernelVecType {
@@ -243,7 +272,19 @@ class SHMManager {
         _thread_num(thread_num),
         _shm_names({""}),
         _shared_mem_ptrs({nullptr}),
-        _shm_ctx(nullptr) {
+        _shm_ctx(nullptr)
+#ifdef __aarch64__
+        ,
+        _allreduce_shm_names({""}),
+        _allreduce_shared_mem_ptrs({nullptr}),
+        _allreduce_workspaces({nullptr}),
+        _allreduce_workspace_local(nullptr),
+        _symmetric_buffer_idx(0),
+        _symmetric_state_idx(0),
+        _distributed_buffer_idx(0),
+        _distributed_state_idx(0)
+#endif
+  {
     _shm_names[rank] = get_shm_name(name, rank);
     _shared_mem_ptrs[rank] = init_shm(rank);
     _shm_ctx = reinterpret_cast<ThreadSHMContext*>(_shared_mem_ptrs[rank]);
@@ -253,6 +294,19 @@ class SHMManager {
           ThreadSHMContext(i, _thread_num, _rank, _group_size,
                            compute_thread_shm_ptr(_shm_ctx, i));
     }
+#ifdef __aarch64__
+    _allreduce_shm_names[rank] = get_allreduce_workspace_name(name, rank);
+    _allreduce_shared_mem_ptrs[rank] = init_allreduce_shm(rank);
+    _allreduce_workspace_local = reinterpret_cast<AArch64AllreduceWorkspace*>(
+        _allreduce_shared_mem_ptrs[rank]);
+    _allreduce_workspaces[rank] = _allreduce_workspace_local;
+    _allreduce_workspace_local->states[0].store(
+        static_cast<int32_t>(AArch64CollState::Alt2AllReduceNaiveCopyInDone),
+        std::memory_order_relaxed);
+    _allreduce_workspace_local->states[1].store(
+        static_cast<int32_t>(AArch64CollState::Begin),
+        std::memory_order_relaxed);
+#endif
   }
 
   void join(const std::string& name) {
@@ -269,6 +323,14 @@ class SHMManager {
               rank_idx, target_ctx + thread_idx,
               compute_thread_shm_ptr(target_ctx, thread_idx));
         }
+#ifdef __aarch64__
+        _allreduce_shm_names[rank_idx] =
+            get_allreduce_workspace_name(name, rank_idx);
+        _allreduce_shared_mem_ptrs[rank_idx] = init_allreduce_shm(rank_idx);
+        _allreduce_workspaces[rank_idx] =
+            reinterpret_cast<AArch64AllreduceWorkspace*>(
+                _allreduce_shared_mem_ptrs[rank_idx]);
+#endif
       }
     }
   }
@@ -280,6 +342,17 @@ class SHMManager {
   static std::string get_shm_name(const std::string& name, int rank) {
     return name + "_" + std::to_string(rank);
   }
+
+#ifdef __aarch64__
+  static std::string get_allreduce_workspace_name(const std::string& name,
+                                                  int rank) {
+    return name + "_allreduce_" + std::to_string(rank);
+  }
+
+  void aarch64_shm_allreduce(torch::Tensor& data) {
+    all_reduce_outer_loop(data, data.numel(), data.nbytes());
+  }
+#endif
 
   static int64_t create_singleton_instance(const std::string& name,
                                            const int group_size, const int rank,
@@ -364,6 +437,243 @@ class SHMManager {
     return shm_ptr;
   }
 
+#ifdef __aarch64__
+  void* init_allreduce_shm(int target_rank) {
+    const std::string& shm_name = _allreduce_shm_names[target_rank];
+    const int local_rank = _rank;
+    constexpr size_t shm_size = sizeof(AArch64AllreduceWorkspace);
+
+    int fd = -1;
+    if (local_rank == target_rank) {
+      fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR,
+                    S_IRUSR | S_IWUSR);
+      if (fd == -1) {
+        TORCH_CHECK(
+            false,
+            "create allreduce shm in SHMManager failed. errno: " +
+                std::to_string(errno));
+      }
+      if (ftruncate(fd, shm_size) == -1) {
+        TORCH_CHECK(
+            false,
+            "ftruncate allreduce shm in SHMManager failed. errno: " +
+                std::to_string(errno));
+      }
+    } else {
+      fd = shm_open(shm_name.c_str(), O_RDWR, S_IRUSR | S_IWUSR);
+      if (fd == -1) {
+        TORCH_CHECK(
+            false,
+            "open allreduce shm in SHMManager failed. errno: " +
+                std::to_string(errno));
+      }
+    }
+
+    void* shm_ptr = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_POPULATE, fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+      TORCH_CHECK(false,
+                  "mmap allreduce shm in SHMManager failed. errno: " +
+                      std::to_string(errno));
+    }
+    if (close(fd) != 0) {
+      TORCH_CHECK(false,
+                  "close allreduce shm in SHMManager failed. errno: " +
+                      std::to_string(errno));
+    }
+    TORCH_CHECK((size_t)shm_ptr % 64 == 0);
+    return shm_ptr;
+  }
+
+  static size_t slice_size(size_t chunk_el, int slice_idx, int world_size) {
+    const size_t base = chunk_el / world_size;
+    return slice_idx == world_size - 1 ? base + (chunk_el % world_size) : base;
+  }
+
+  static char* slice_data(char* data_ptr, size_t chunk_el, int elem_size,
+                          int slice_idx, int world_size) {
+    const size_t base = chunk_el / world_size;
+    return data_ptr + (base * slice_idx) * elem_size;
+  }
+
+  static size_t slice_el_start(size_t chunk_el, int slice_idx, int world_size) {
+    return (chunk_el / world_size) * slice_idx;
+  }
+
+  static void wait_buffer_state_until_2(AArch64AllreduceWorkspace* workspace,
+                                        int state_group,
+                                        AArch64CollState state0,
+                                        AArch64CollState state1) {
+    for (;;) {
+      const auto current = static_cast<AArch64CollState>(
+          workspace->states[state_group].load(std::memory_order_acquire));
+      if (current == state0 || current == state1) {
+        break;
+      }
+      __asm__ __volatile__("yield");
+    }
+  }
+
+  void reduce_all_buffers(int start_elements, int num_elements,
+                          c10::ScalarType scalar_type, char* to_buffer,
+                          char** buffers) {
+    switch (scalar_type) {
+      case c10::ScalarType::BFloat16:
+        reduce_bf16_buffers(start_elements, num_elements, to_buffer, buffers,
+                            _group_size);
+        break;
+      case c10::ScalarType::Half:
+        reduce_fp16_buffers(start_elements, num_elements, to_buffer, buffers,
+                            _group_size);
+        break;
+      case c10::ScalarType::Float:
+        reduce_fp32_buffers(start_elements, num_elements, to_buffer, buffers,
+                            _group_size);
+        break;
+      default:
+        TORCH_CHECK(false,
+                    "Unsupported dtype for AArch64 SHM allreduce: ",
+                    scalar_type);
+    }
+  }
+
+  void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type,
+                                  size_t chunk_size, size_t chunk_el) {
+    constexpr int state_group = 0;
+    AArch64CollState copy_current =
+        AArch64CollState::AllReduceNaiveCopyInDone;
+    AArch64CollState copy_next = AArch64CollState::Alt1AllReduceNaiveCopyInDone;
+
+    switch (_symmetric_state_idx) {
+      case 0:
+        copy_current = AArch64CollState::AllReduceNaiveCopyInDone;
+        copy_next = AArch64CollState::Alt1AllReduceNaiveCopyInDone;
+        break;
+      case 1:
+        copy_current = AArch64CollState::Alt1AllReduceNaiveCopyInDone;
+        copy_next = AArch64CollState::Alt2AllReduceNaiveCopyInDone;
+        break;
+      case 2:
+        copy_current = AArch64CollState::Alt2AllReduceNaiveCopyInDone;
+        copy_next = AArch64CollState::AllReduceNaiveCopyInDone;
+        break;
+      default:
+        TORCH_CHECK(false, "Invalid symmetric allreduce state index");
+    }
+    _symmetric_state_idx = (_symmetric_state_idx + 1) % 3;
+
+    char* current_buffers[MAX_SHM_RANK_NUM] = {nullptr};
+    for (int i = 0; i < _group_size; ++i) {
+      current_buffers[i] =
+          _allreduce_workspaces[i]->buffer +
+          aarch64_buffer0_offset(_symmetric_buffer_idx);
+    }
+
+    parallel_memcpy(current_buffers[_rank], data_ptr, chunk_size);
+    std::atomic_thread_fence(std::memory_order_release);
+    _allreduce_workspace_local->states[state_group].store(
+        static_cast<int32_t>(copy_current), std::memory_order_release);
+
+    for (int i = 0; i < _group_size; ++i) {
+      if (i != _rank) {
+        wait_buffer_state_until_2(_allreduce_workspaces[i], state_group,
+                                  copy_current, copy_next);
+      }
+    }
+
+    reduce_all_buffers(0, chunk_el, scalar_type, data_ptr, current_buffers);
+    _symmetric_buffer_idx = 1 - _symmetric_buffer_idx;
+  }
+
+  void distributed_naive_reduce(char* data_ptr, c10::ScalarType scalar_type,
+                                size_t chunk_size, size_t chunk_el) {
+    constexpr int state_group = 1;
+    AArch64CollState copy_current =
+        AArch64CollState::AllReduceNaiveCopyInDone;
+    AArch64CollState reduce_current = AArch64CollState::AllReduceNaiveReduceDone;
+    AArch64CollState copy_next = AArch64CollState::Alt1AllReduceNaiveCopyInDone;
+
+    switch (_distributed_state_idx) {
+      case 0:
+        copy_current = AArch64CollState::AllReduceNaiveCopyInDone;
+        reduce_current = AArch64CollState::AllReduceNaiveReduceDone;
+        copy_next = AArch64CollState::Alt1AllReduceNaiveCopyInDone;
+        break;
+      case 1:
+        copy_current = AArch64CollState::Alt1AllReduceNaiveCopyInDone;
+        reduce_current = AArch64CollState::Alt1AllReduceNaiveReduceDone;
+        copy_next = AArch64CollState::AllReduceNaiveCopyInDone;
+        break;
+      default:
+        TORCH_CHECK(false, "Invalid distributed allreduce state index");
+    }
+    _distributed_state_idx = (_distributed_state_idx + 1) % 2;
+
+    char* current_buffers[MAX_SHM_RANK_NUM] = {nullptr};
+    for (int i = 0; i < _group_size; ++i) {
+      current_buffers[i] =
+          _allreduce_workspaces[i]->buffer +
+          aarch64_buffer1_offset(_distributed_buffer_idx);
+    }
+
+    const int elem_size = chunk_size / chunk_el;
+    parallel_memcpy(current_buffers[_rank], data_ptr, chunk_size);
+    std::atomic_thread_fence(std::memory_order_release);
+    _allreduce_workspace_local->states[state_group].store(
+        static_cast<int32_t>(copy_current), std::memory_order_release);
+
+    for (int i = 0; i < _group_size; ++i) {
+      if (i != _rank) {
+        wait_buffer_state_until_2(_allreduce_workspaces[i], state_group,
+                                  copy_current, reduce_current);
+      }
+    }
+
+    reduce_all_buffers(
+        slice_el_start(chunk_el, _rank, _group_size),
+        slice_size(chunk_el, _rank, _group_size), scalar_type,
+        current_buffers[_rank], current_buffers);
+    std::atomic_thread_fence(std::memory_order_release);
+    _allreduce_workspace_local->states[state_group].store(
+        static_cast<int32_t>(reduce_current), std::memory_order_release);
+
+    for (int i = 0; i < _group_size; ++i) {
+      if (i != _rank) {
+        wait_buffer_state_until_2(_allreduce_workspaces[i], state_group,
+                                  reduce_current, copy_next);
+      }
+    }
+
+    for (int i = 0; i < _group_size; ++i) {
+      const int rank = (i + _rank) % _group_size;
+      parallel_memcpy(
+          slice_data(data_ptr, chunk_el, elem_size, rank, _group_size),
+          slice_data(current_buffers[rank], chunk_el, elem_size, rank,
+                     _group_size),
+          slice_size(chunk_el, rank, _group_size) * elem_size);
+    }
+
+    _distributed_buffer_idx = 1 - _distributed_buffer_idx;
+  }
+
+  void all_reduce_outer_loop(torch::Tensor& data, size_t numel, int data_size) {
+    for (int offset = 0; offset < data_size;
+         offset += SHM_ALLREDUCE_MAX_BUF_SIZE) {
+      char* data_ptr = (char*)(data.data_ptr()) + offset;
+      size_t chunk_size =
+          std::min<size_t>(SHM_ALLREDUCE_MAX_BUF_SIZE, data_size - offset);
+      size_t chunk_el = chunk_size / (data_size / numel);
+      if (chunk_size < SHM_ALLREDUCE_THRESHOLD) {
+        symmetric_naive_all_reduce(data_ptr, data.scalar_type(), chunk_size,
+                                   chunk_el);
+      } else {
+        distributed_naive_reduce(data_ptr, data.scalar_type(), chunk_size,
+                                 chunk_el);
+      }
+    }
+  }
+#endif
+
   void destroy_shm() {
     std::stringstream ss;
     ss << "local rank " << _rank << ": [";
@@ -377,9 +687,21 @@ class SHMManager {
         munmap(_shared_mem_ptrs[i], compute_shm_size());
       }
 
+#ifdef __aarch64__
+      if (_allreduce_shared_mem_ptrs[i] != nullptr) {
+        munmap(_allreduce_shared_mem_ptrs[i],
+               sizeof(AArch64AllreduceWorkspace));
+      }
+#endif
+
       if (!_shm_names[i].empty()) {
         shm_unlink(_shm_names[i].c_str());
       }
+#ifdef __aarch64__
+      if (!_allreduce_shm_names[i].empty()) {
+        shm_unlink(_allreduce_shm_names[i].c_str());
+      }
+#endif
     }
   }
 
@@ -389,6 +711,17 @@ class SHMManager {
   std::array<std::string, MAX_SHM_RANK_NUM> _shm_names;
   std::array<void*, MAX_SHM_RANK_NUM> _shared_mem_ptrs;
   ThreadSHMContext* _shm_ctx;
+#ifdef __aarch64__
+  std::array<std::string, MAX_SHM_RANK_NUM> _allreduce_shm_names;
+  std::array<void*, MAX_SHM_RANK_NUM> _allreduce_shared_mem_ptrs;
+  std::array<AArch64AllreduceWorkspace*, MAX_SHM_RANK_NUM>
+      _allreduce_workspaces;
+  AArch64AllreduceWorkspace* _allreduce_workspace_local;
+  int _symmetric_buffer_idx;
+  int _symmetric_state_idx;
+  int _distributed_buffer_idx;
+  int _distributed_state_idx;
+#endif
 };
 
 namespace shm_cc_ops {
@@ -827,12 +1160,18 @@ void shm_all_gather(int64_t handle, const torch::Tensor& data,
 
 void shm_allreduce(int64_t handle, torch::Tensor& data) {
   TORCH_CHECK(data.is_contiguous())
+#ifdef __aarch64__
+  auto* shm_manager = SHMManager::get_singleton_instance(handle);
+  TORCH_CHECK(shm_manager);
+  shm_manager->aarch64_shm_allreduce(data);
+#else
   VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_allreduce_sum", [&] {
     CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
     shm_allreduce_sum(SHMManager::get_singleton_instance(handle)->get_shm_ctx(),
                       data.data_ptr<scalar_t>(), data.numel());
     CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
   });
+#endif
 }
 
 void shm_send_tensor_list(int64_t handle,

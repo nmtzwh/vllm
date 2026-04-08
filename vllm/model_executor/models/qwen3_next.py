@@ -760,7 +760,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        mixed_qkv = mixed_qkv[:num_actual_tokens].contiguous()
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
         conv_weights = self.conv1d.weight.view(
@@ -848,7 +848,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        mixed_qkv = mixed_qkv[:num_actual_tokens].contiguous()
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
@@ -912,7 +912,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        mixed_qkv = mixed_qkv[:num_actual_tokens].contiguous()
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
@@ -1171,7 +1171,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        mixed_qkv = mixed_qkv[:num_actual_tokens].contiguous()
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
@@ -1359,7 +1359,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        mixed_qkv = mixed_qkv[:num_actual_tokens].contiguous()
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 

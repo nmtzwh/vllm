@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import ctypes
 from collections.abc import Callable
 from typing import Any
 
@@ -43,6 +44,15 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     batch = src_ptrs.shape[0]
     assert dst_ptrs.shape[0] == batch
     assert sizes.shape[0] == batch
+
+    if src_ptrs.device.type != "cuda":
+        src_ptrs_cpu = src_ptrs.tolist()
+        dst_ptrs_cpu = dst_ptrs.tolist()
+        sizes_cpu = sizes.tolist()
+        for src_ptr, dst_ptr, size in zip(src_ptrs_cpu, dst_ptrs_cpu, sizes_cpu):
+            if size > 0:
+                ctypes.memmove(dst_ptr, src_ptr, size)
+        return
 
     grid = (batch,)
     BLOCK_SIZE = 1024

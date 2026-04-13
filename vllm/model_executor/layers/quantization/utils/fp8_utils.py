@@ -361,6 +361,12 @@ class W8A8BlockFp8LinearOp:
     ):
         self.weight_group_shape = weight_group_shape
         self.act_quant_group_shape = act_quant_group_shape
+        self._is_cpu = current_platform.is_cpu()
+        self._cpu_sgl_fp8_enabled = bool(
+            self._is_cpu
+            and envs.VLLM_CPU_SGL_KERNEL
+            and hasattr(torch.ops._C, "fp8_scaled_mm")
+        )
         if use_deep_gemm is not None:
             self.is_deep_gemm_supported = use_deep_gemm
         else:
@@ -404,8 +410,8 @@ class W8A8BlockFp8LinearOp:
         output_shape = [*input.shape[:-1], weight.shape[0]]
         output_dtype = input.dtype
 
-        if current_platform.is_cpu():
-            if hasattr(torch.ops._C, "fp8_scaled_mm") and self._cpu_sgl_supported(weight):
+        if self._is_cpu:
+            if self._cpu_sgl_supported(weight):
                 output = self._run_cpu(input_2d, weight, weight_scale)
             else:
                 output = self._run_cpu_fallback(input_2d, weight, weight_scale)
@@ -436,9 +442,7 @@ class W8A8BlockFp8LinearOp:
     def _cpu_sgl_supported(self, weight: torch.Tensor) -> bool:
         block_n, block_k = tuple(self.weight_group_shape)
         return bool(
-            current_platform.is_cpu()
-            and envs.VLLM_CPU_SGL_KERNEL
-            and hasattr(torch.ops._C, "fp8_scaled_mm")
+            self._cpu_sgl_fp8_enabled
             and check_cpu_sgl_fp8_linear_kernel(
                 int(weight.shape[0]),
                 int(weight.shape[1]),

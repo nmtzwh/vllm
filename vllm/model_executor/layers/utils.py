@@ -16,6 +16,20 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+
+def _detect_cpu_sgl_isa_support() -> bool:
+    arch = current_platform.get_cpu_architecture()
+    if arch == CpuArchEnum.X86:
+        return torch._C._cpu._is_amx_tile_supported()
+    if arch == CpuArchEnum.ARM:
+        return True
+    return False
+
+
+# Resolve CPU SGL ISA support once at import time so TorchDynamo does not need to
+# trace platform/ISA introspection from inside compiled forward paths.
+_CPU_SGL_ISA_SUPPORTED = _detect_cpu_sgl_isa_support()
+
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "gate",
     "router",
@@ -211,15 +225,8 @@ direct_register_custom_op(
 
 
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
-    arch = current_platform.get_cpu_architecture()
-    if arch == CpuArchEnum.X86:
-        isa_supported = torch._C._cpu._is_amx_tile_supported()
-    elif arch == CpuArchEnum.ARM:
-        isa_supported = True
-    else:
-        isa_supported = False
     return (
-        isa_supported
+        _CPU_SGL_ISA_SUPPORTED
         and (dtype in (torch.bfloat16, torch.int8))
         and k % 32 == 0
         and n % 32 == 0
@@ -233,15 +240,8 @@ def check_cpu_sgl_fp8_linear_kernel(
     block_n: int,
     block_k: int,
 ) -> bool:
-    arch = current_platform.get_cpu_architecture()
-    if arch == CpuArchEnum.X86:
-        isa_supported = torch._C._cpu._is_amx_tile_supported()
-    elif arch == CpuArchEnum.ARM:
-        isa_supported = True
-    else:
-        isa_supported = False
     return (
-        isa_supported
+        _CPU_SGL_ISA_SUPPORTED
         and dtype == torch.float8_e4m3fn
         and block_k == 128
         and block_n % 32 == 0
@@ -258,15 +258,8 @@ def check_cpu_sgl_fp8_moe_kernel(
         return False
 
     block_n, block_k = int(block_size[0]), int(block_size[1])
-    arch = current_platform.get_cpu_architecture()
-    if arch == CpuArchEnum.X86:
-        isa_supported = torch._C._cpu._is_amx_tile_supported()
-    elif arch == CpuArchEnum.ARM:
-        isa_supported = True
-    else:
-        isa_supported = False
     return (
-        isa_supported
+        _CPU_SGL_ISA_SUPPORTED
         and dtype == torch.float8_e4m3fn
         and block_k == 128
         and block_n % 32 == 0

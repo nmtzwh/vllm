@@ -163,17 +163,6 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
 
   omp_destroy_lock(&writelock);
 
-  cpu_set_t main_thread_mask;
-  CPU_ZERO(&main_thread_mask);
-  CPU_SET(omp_cpu_ids.front(), &main_thread_mask);
-  ret = sched_setaffinity(0, sizeof(cpu_set_t), &main_thread_mask);
-  if (ret == -1) {
-    TORCH_CHECK(
-        false,
-        "sched_setaffinity failed while pinning main thread. errno: " +
-            std::to_string(errno));
-  }
-
   numa_free_nodemask(omp_cpu_mask);
 
   std::stringstream ss;

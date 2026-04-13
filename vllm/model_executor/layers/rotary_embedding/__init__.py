@@ -12,6 +12,7 @@ from .dual_chunk_rope import DualChunkRotaryEmbedding
 from .dynamic_ntk_alpha_rope import DynamicNTKAlphaRotaryEmbedding
 from .dynamic_ntk_scaling_rope import DynamicNTKScalingRotaryEmbedding
 from .fope import FourierRotaryEmbedding
+from .gemma4_rope import Gemma4RotaryEmbedding
 from .linear_scaling_rope import LinearScalingRotaryEmbedding
 from .llama3_rope import Llama3RotaryEmbedding
 from .llama4_vision_rope import Llama4VisionRotaryEmbedding
@@ -164,6 +165,15 @@ def get_rope(
             base,
             is_neox_style,
             scaling_factor,
+            dtype,
+        )
+    elif scaling_type == "proportional":
+        rotary_emb = Gemma4RotaryEmbedding(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
             dtype,
         )
     elif scaling_type == "ntk":

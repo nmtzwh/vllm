@@ -685,6 +685,8 @@ def get_config(
         **kwargs,
     )
 
+    _normalize_text_only_architectures(config)
+
     # Patching defaults for GGUF models
     if _is_gguf:
         # Some models have different default values between GGUF and HF.
@@ -783,6 +785,23 @@ def get_config(
         maybe_register_config_serialize_by_value()
 
     return config
+
+
+def _normalize_text_only_architectures(config: PretrainedConfig) -> None:
+    """Apply model-specific text-only architecture normalization.
+
+    Gemma4 text checkpoints may expose the root multimodal architecture
+    ``Gemma4ForConditionalGeneration`` even when only the text executor is
+    required. Normalize that case to ``Gemma4ForCausalLM`` so the text model
+    resolves without requiring user hf_overrides.
+    """
+    model_type = getattr(config, "model_type", None)
+    architectures = getattr(config, "architectures", None)
+    if model_type in ("gemma4", "gemma4_text"):
+        if architectures == ["Gemma4ForConditionalGeneration"]:
+            config.update({"architectures": ["Gemma4ForCausalLM"]})
+        elif not architectures:
+            config.update({"architectures": ["Gemma4ForCausalLM"]})
 
 
 @cache

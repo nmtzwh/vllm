@@ -57,6 +57,38 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
         hf_config.is_causal = not hf_config.use_bidirectional_attention
 
 
+class Gemma4Config(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        """Force unified attention backend for heterogeneous head sizes.
+
+        Some Gemma4 variants use a larger head dim for full-attention layers
+        than for sliding-attention layers. If vLLM mixes attention backends
+        across those layer types, outputs can diverge. Force Triton when the
+        user has not chosen a backend and the larger head size exceeds the FA
+        kernel limit.
+        """
+        hf_text_config = vllm_config.model_config.hf_text_config
+        head_dim = getattr(hf_text_config, "head_dim", None)
+        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        max_head_dim = max(head_dim or 0, global_head_dim or 0)
+        if (
+            head_dim is not None
+            and global_head_dim is not None
+            and head_dim != global_head_dim
+            and max_head_dim > 256
+            and vllm_config.attention_config.backend is None
+        ):
+            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+            logger.info(
+                "Gemma4 model has heterogeneous head dimensions "
+                "(head_dim=%d, global_head_dim=%d). Forcing TRITON_ATTN "
+                "backend to prevent mixed-backend numerical divergence.",
+                head_dim,
+                global_head_dim,
+            )
+
+
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -651,6 +683,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,
+    "Gemma4ForCausalLM": Gemma4Config,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,

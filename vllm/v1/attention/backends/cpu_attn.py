@@ -135,6 +135,13 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         self.block_size = vllm_config.cache_config.block_size
         self.isa = _get_attn_isa(self.dtype, self.block_size, self.head_dim)
         self.is_cross_attention = isinstance(kv_cache_spec, CrossAttentionSpec)
+        # The CPU split-KV reduction path is reliable for the existing
+        # head sizes, but head_dim=512 was only recently enabled to support
+        # Gemma4 full-attention layers. Keep 512-dim decode on the simpler
+        # non-split path until the large-head split/reduction path is
+        # validated. This preserves functional support and avoids stalls in
+        # long-context decode.
+        self.enable_kv_split = self.head_dim < 512
 
     def build(
         self,
@@ -181,7 +188,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             causal=causal,
             sliding_window_size=self.window_size,
             isa=self.isa,
-            enable_kv_split=True,
+            enable_kv_split=self.enable_kv_split,
         )
 
         attn_metadata = CPUAttentionMetadata(
